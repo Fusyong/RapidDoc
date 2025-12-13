@@ -4,6 +4,7 @@
 venv*/
 envs/
 slurm_logs/
+.venv/
 
 sync1.sh
 data_preprocess_pj1
