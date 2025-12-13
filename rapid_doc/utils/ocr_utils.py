@@ -1,5 +1,7 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import copy
+import math
+
 import cv2
 import numpy as np
 
@@ -92,6 +94,11 @@ def alpha_to_color(img, alpha_color=(255, 255, 255)):
 def preprocess_image(_image):
     alpha_color = (255, 255, 255)
     _image = alpha_to_color(_image, alpha_color)
+
+    # OCR预处理优化
+    # gray = cv2.cvtColor(_image, cv2.COLOR_BGR2GRAY)
+    # _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # _image = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
     return _image
 
 
@@ -310,7 +317,7 @@ def merge_det_boxes(dt_boxes):
     return new_dt_boxes
 
 
-def get_adjusted_mfdetrec_res(single_page_mfdetrec_res, useful_list):
+def get_adjusted_mfdetrec_res(single_page_mfdetrec_res, useful_list, return_text=False):
     paste_x, paste_y, xmin, ymin, xmax, ymax, new_width, new_height = useful_list
     # Adjust the coordinates of the formula area
     adjusted_mfdetrec_res = []
@@ -325,13 +332,36 @@ def get_adjusted_mfdetrec_res(single_page_mfdetrec_res, useful_list):
         if any([x1 < 0, y1 < 0]) or any([x0 > new_width, y0 > new_height]):
             continue
         else:
-            adjusted_mfdetrec_res.append({
-                "bbox": [x0, y0, x1, y1],
-            })
+            return_res = { "bbox": [x0, y0, x1, y1]}
+            if return_text:
+                if mf_res.get('latex'):
+                    return_res["latex"] = mf_res['latex']
+                if mf_res.get('checkbox'):
+                    return_res["checkbox"] = mf_res['checkbox']
+            adjusted_mfdetrec_res.append(return_res)
     return adjusted_mfdetrec_res
 
+def is_mostly_tilted(ocr_res, threshold=1.0):
+    """分析 OCR 检测框是否整体倾斜"""
+    angles = []
+    for poly in ocr_res:
+        p0, p1 = poly[0], poly[1]
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        angle_deg = abs(math.degrees(math.atan2(dy, dx))) % 180
+        angles.append(round(angle_deg, 2))
+    if not angles:
+        return False
+    # 取平均角度而不是众数
+    avg_angle = sum(angles) / len(angles)
+    avg_angle = round(avg_angle, 2)
+    mostly_tilted = abs(avg_angle) > threshold and abs(avg_angle - 180) > threshold
+    return mostly_tilted
 
-def get_ocr_result_list(ocr_res, useful_list, ocr_enable, bgr_image, lang):
+def get_ocr_result_list(ocr_res, useful_list, ocr_enable, bgr_image, lang, original_label):
+    if not ocr_enable and is_mostly_tilted(ocr_res):
+        # 非ocr时，如果文字倾斜，则强制走ocr
+        ocr_enable = True
     paste_x, paste_y, xmin, ymin, xmax, ymax, new_width, new_height = useful_list
     ocr_result_list = []
     ori_im = bgr_image.copy()
@@ -373,14 +403,15 @@ def get_ocr_result_list(ocr_res, useful_list, ocr_enable, bgr_image, lang):
             p4 = [x_center - new_width / 2, y_center + new_height / 2]
 
         # Convert the coordinates back to the original coordinate system
-        p1 = [p1[0] - paste_x + xmin, p1[1] - paste_y + ymin]
-        p2 = [p2[0] - paste_x + xmin, p2[1] - paste_y + ymin]
-        p3 = [p3[0] - paste_x + xmin, p3[1] - paste_y + ymin]
-        p4 = [p4[0] - paste_x + xmin, p4[1] - paste_y + ymin]
+        p1 = [float(p1[0] - paste_x + xmin), float(p1[1] - paste_y + ymin)]
+        p2 = [float(p2[0] - paste_x + xmin), float(p2[1] - paste_y + ymin)]
+        p3 = [float(p3[0] - paste_x + xmin), float(p3[1] - paste_y + ymin)]
+        p4 = [float(p4[0] - paste_x + xmin), float(p4[1] - paste_y + ymin)]
 
         if ocr_enable:
             ocr_result_list.append({
                 'category_id': 15,
+                'original_label': original_label,
                 'poly': p1 + p2 + p3 + p4,
                 'score': 1,
                 'text': text,
@@ -390,6 +421,7 @@ def get_ocr_result_list(ocr_res, useful_list, ocr_enable, bgr_image, lang):
         else:
             ocr_result_list.append({
                 'category_id': 15,
+                'original_label': original_label,
                 'poly': p1 + p2 + p3 + p4,
                 'score': float(round(score, 2)),
                 'text': text,
@@ -450,6 +482,12 @@ def calculate_is_angle(poly):
         # logger.info((p3[1] - p1[1])/height)
         return True
 
+def is_bbox_aligned_rect(points):
+    x_coords = points[:, 0]
+    y_coords = points[:, 1]
+    unique_x = np.unique(x_coords)
+    unique_y = np.unique(y_coords)
+    return len(unique_x) == 2 and len(unique_y) == 2
 
 def get_rotate_crop_image(img, points):
     '''
@@ -463,6 +501,16 @@ def get_rotate_crop_image(img, points):
     points[:, 1] = points[:, 1] - top
     '''
     assert len(points) == 4, "shape of points must be 4*2"
+
+    # if is_bbox_aligned_rect(points):
+    #     xmin = int(np.min(points[:, 0]))
+    #     xmax = int(np.max(points[:, 0]))
+    #     ymin = int(np.min(points[:, 1]))
+    #     ymax = int(np.max(points[:, 1]))
+    #     new_img = img[ymin:ymax, xmin:xmax].copy()
+    #     if new_img.shape[0] > 0 and new_img.shape[1] > 0:
+    #         return new_img
+
     img_crop_width = int(
         max(
             np.linalg.norm(points[0] - points[1]),

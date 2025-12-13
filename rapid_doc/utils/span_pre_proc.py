@@ -1,16 +1,19 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import collections
 import re
+import math
 import statistics
+import uuid
+from collections import Counter
 
 import cv2
 import numpy as np
-from loguru import logger
 
 from rapid_doc.utils.boxbase import calculate_overlap_area_in_bbox1_area_ratio, calculate_iou, \
-    get_minbox_if_overlap_by_ratio
+    get_minbox_if_overlap_by_ratio, merge_adjacent_bboxes, is_in
 from rapid_doc.utils.enum_class import BlockType, ContentType
-from rapid_doc.utils.pdf_image_tools import get_crop_img, get_crop_np_img
+from rapid_doc.utils.ocr_utils import update_det_boxes
+from rapid_doc.utils.pdf_image_tools import get_crop_np_img
 from rapid_doc.utils.pdf_text_tool import get_page
 
 
@@ -118,11 +121,142 @@ def __replace_unicode(text: str):
     }
     return re.sub('|'.join(map(re.escape, ligatures.keys())), lambda m: ligatures[m.group()], text)
 
+"""pdf_text bbox提取"""
+def txt_spans_bbox_extract(page_dict, input_res, mfd_res, scale, useful_list):
+    paste_x, paste_y, xmin, ymin, xmax, ymax, new_width, new_height = useful_list
+    poly = input_res['poly']
+    input_res_bbox = [poly[0]/scale, poly[1]/scale, poly[4]/scale, poly[5]/scale]
+
+    page_text_span = []
+    for block in page_dict['blocks']:
+        for line in block['lines']:
+            if 0 < abs(line['rotation']) < 90:
+                # 旋转角度在0-90度之间的行，直接跳过
+                continue
+            for span in line['spans']:
+                bbox = span['bbox'].bbox  # 获取坐标框
+                text = span['text']  # 获取文字内容
+                if calculate_text_in_span(bbox, input_res_bbox, text):
+                    page_text_span.append(span)
+    # 合并相邻或重叠的文字框
+    page_text_span = merge_adjacent_bboxes(page_text_span)
+    page_text_bbox = [item['bbox'] for item in page_text_span if 'bbox' in item]
+    dt_boxes = []
+    # 转换为和ocr-det一样的格式
+    for bbox in page_text_bbox:
+        bbox = [bbox[0]*scale, bbox[1]*scale, bbox[2]*scale, bbox[3]*scale]
+        p1 = [bbox[0] + paste_x - xmin, bbox[1] + paste_y - ymin]
+        p2 = [bbox[2] + paste_x - xmin, bbox[1] + paste_y - ymin]
+        p3 = [bbox[2] + paste_x - xmin, bbox[3] + paste_y - ymin]
+        p4 = [bbox[0] + paste_x - xmin, bbox[3] + paste_y - ymin]
+        bbox = [p1, p2, p3, p4]
+        dt_boxes.append(bbox)
+    # 根据公式位置更新检测框
+    if mfd_res:
+        dt_boxes = update_det_boxes(dt_boxes, mfd_res)
+    if not dt_boxes:
+        # pdf里提取不到，用ocr-det提取
+        input_res['need_ocr_det'] = True
+    return dt_boxes
+
+
+"""most_angle bbox提取（表格里的文字）"""
+def txt_most_angle_extract_table(page_dict, table_res_dict, scale):
+    input_res = table_res_dict['table_res']
+    poly = input_res['poly']
+    input_res_bbox = [poly[0]/scale, poly[1]/scale, poly[4]/scale, poly[5]/scale]
+    angles = []  # 所有行的旋转角度
+    page_text_span = []
+    for block in page_dict['blocks']:
+        for line in block['lines']:
+            # if 0 < abs(line['rotation']) < 90:
+            #     # 旋转角度在0-90度之间的行，直接跳过
+            #     continue
+            angle_deg = int(round(line['rotation'] * 180 / math.pi)) % 360
+            for span in line['spans']:
+                bbox = span['bbox'].bbox  # 获取坐标框
+                text = span['text']  # 获取文字内容
+                if calculate_text_in_span(bbox, input_res_bbox, text):
+                    angles.append(angle_deg)
+                    page_text_span.append(span)
+    if angles:
+        angle_counts = Counter(angles)
+        most_angle = angle_counts.most_common(1)[0][0]  # 取最多的角度
+    else:
+        most_angle = 0
+    return most_angle
+
+"""判断是否是背景图（背景图片里有文字）"""
+def txt_in_ori_image(page_dict, ori_image_bbox):
+    for block in page_dict['blocks']:
+        for line in block['lines']:
+            for span in line['spans']:
+                bbox = span['bbox'].bbox  # 获取坐标框
+                text = span['text']  # 获取文字内容
+                if calculate_text_in_span(bbox, ori_image_bbox, text):
+                    return True
+    return False
+
+
+"""提取表格里的图片"""
+def extract_table_fill_image(page_dict, table_res_dict, scale, table_extract_original_image):
+    input_res = table_res_dict['table_res']
+    ori_image_list = page_dict['ori_image_list']
+    useful_list = table_res_dict['useful_list']
+    layout_image_list = input_res.get('layout_image_list', [])
+
+    paste_x, paste_y, xmin, ymin, xmax, ymax, new_width, new_height = useful_list
+    poly = input_res['poly']
+    input_res_bbox = [poly[0]/scale, poly[1]/scale, poly[4]/scale, poly[5]/scale]
+    image_res = []
+
+    if table_extract_original_image and ori_image_list:
+        for image in ori_image_list:
+            # 找到在表格里的图片
+            bbox = image['bbox']
+            # calculate_iou如果大于0.9，这个表格可能是图片
+            if is_in(bbox, input_res_bbox) and calculate_iou(bbox, input_res_bbox) < 0.9:
+                # 把坐标转为相对于表格的坐标
+                bbox = [bbox[0] * scale, bbox[1] * scale, bbox[2] * scale, bbox[3] * scale]
+                image['ori_bbox'] = bbox
+                p1 = [bbox[0] + paste_x - xmin, bbox[1] + paste_y - ymin]
+                p2 = [bbox[2] + paste_x - xmin, bbox[1] + paste_y - ymin]
+                p3 = [bbox[2] + paste_x - xmin, bbox[3] + paste_y - ymin]
+                p4 = [bbox[0] + paste_x - xmin, bbox[3] + paste_y - ymin]
+                image['ocr_bbox'] = [p1, p2, p3, p4]
+                # image['pil_image'].save(f"{image['uuid']}.png")
+                image_res.append(image)
+    if not image_res and layout_image_list:
+        # pypdfium2获取不到图片，使用版面识别的表格里的图片
+        # 把坐标转为相对于表格的坐标
+        for image in layout_image_list:
+            # 把坐标转为相对于表格的坐标
+            bbox = image['poly']
+            bbox = [bbox[0], bbox[1], bbox[4], bbox[5]]
+            image['ori_bbox'] = bbox
+            p1 = [bbox[0] + paste_x - xmin, bbox[1] + paste_y - ymin]
+            p2 = [bbox[2] + paste_x - xmin, bbox[1] + paste_y - ymin]
+            p3 = [bbox[2] + paste_x - xmin, bbox[3] + paste_y - ymin]
+            p4 = [bbox[0] + paste_x - xmin, bbox[3] + paste_y - ymin]
+            image['bbox'] = bbox
+            image['ocr_bbox'] = [p1, p2, p3, p4]
+            image_res.append(image)
+        # 把image_res放到page_dict里面，方便后续保存图片
+    if not page_dict.get('table_fill_image_list'):
+        page_dict['table_fill_image_list'] = image_res
+    else:
+        page_dict['table_fill_image_list'].extend(image_res)
+    # table_res_dict['table_res'].pop('layout_image_list', None)
+    return image_res
 
 """pdf_text dict方案 char级别"""
-def txt_spans_extract(pdf_page, spans, input_img, scale, all_bboxes, all_discarded_blocks):
-
-    page_dict = get_page(pdf_page)
+def txt_spans_extract(pdf_page_or_dict, spans, input_img, scale, all_bboxes, all_discarded_blocks, return_word_box=False, useful_list=None):
+    # 判断类型
+    if isinstance(pdf_page_or_dict, dict):
+        page_dict = pdf_page_or_dict
+    else:
+        # 是 pdfium.PdfPage
+        page_dict = get_page(pdf_page_or_dict)
 
     page_all_chars = []
     page_all_lines = []
@@ -188,7 +322,7 @@ def txt_spans_extract(pdf_page, spans, input_img, scale, all_bboxes, all_discard
             span['chars'] = []
             new_spans.append(span)
 
-    need_ocr_spans = fill_char_in_spans(new_spans, page_all_chars, median_span_height)
+    need_ocr_spans = fill_char_in_spans(new_spans, page_all_chars, median_span_height, return_word_box, useful_list, scale)
 
     """对未填充的span进行ocr"""
     if len(need_ocr_spans) > 0:
@@ -212,7 +346,7 @@ def txt_spans_extract(pdf_page, spans, input_img, scale, all_bboxes, all_discard
     return spans
 
 
-def fill_char_in_spans(spans, all_chars, median_span_height):
+def fill_char_in_spans(spans, all_chars, median_span_height, return_word_box=False, useful_list=None, scale=None):
     # 简单从上到下排一下序
     spans = sorted(spans, key=lambda x: x['bbox'][1])
 
@@ -238,7 +372,7 @@ def fill_char_in_spans(spans, all_chars, median_span_height):
 
     need_ocr_spans = []
     for span in spans:
-        chars_to_content(span)
+        chars_to_content(span, return_word_box, useful_list, scale)
         # 有的span中虽然没有字但有一两个空的占位符，用宽高和content长度过滤
         if len(span['content']) * span['height'] < span['width'] * 0.5:
             # logger.info(f"maybe empty span: {len(span['content'])}, {span['height']}, {span['width']}")
@@ -285,8 +419,37 @@ def calculate_char_in_span(char_bbox, span_bbox, char, span_height_radio=Span_He
         else:
             return False
 
+def calculate_text_in_span(char_bbox, span_bbox, char):
+    char_center_x = (char_bbox[0] + char_bbox[2]) / 2
+    char_center_y = (char_bbox[1] + char_bbox[3]) / 2
+    span_height = span_bbox[3] - span_bbox[1]
 
-def chars_to_content(span):
+    if (
+        span_bbox[0] < char_center_x < span_bbox[2]
+        and span_bbox[1] < char_center_y < span_bbox[3]
+    ):
+        return True
+    else:
+        # 如果char是LINE_STOP_FLAG，就不用中心点判定，换一种方案（左边界在span区域内，高度判定和之前逻辑一致）
+        # 主要是给结尾符号一个进入span的机会，这个char还应该离span右边界较近
+        if char in LINE_STOP_FLAG:
+            if (
+                (span_bbox[2] - span_height) < char_bbox[0] < span_bbox[2]
+                and char_center_x > span_bbox[0]
+                and span_bbox[1] < char_center_y < span_bbox[3]
+            ):
+                return True
+        elif char in LINE_START_FLAG:
+            if (
+                span_bbox[0] < char_bbox[2] < (span_bbox[0] + span_height)
+                and char_center_x < span_bbox[2]
+                and span_bbox[1] < char_center_y < span_bbox[3]
+            ):
+                return True
+        else:
+            return False
+
+def chars_to_content(span, return_word_box=False, useful_list=None, scale=None):
     # 检查span中的char是否为空
     if len(span['chars']) == 0:
         pass
@@ -300,22 +463,40 @@ def chars_to_content(span):
         median_width = statistics.median(char_widths)
 
         content = ''
+        word_result = []
         for char in span['chars']:
-
             # 如果下一个char的x0和上一个char的x1距离超过0.25个字符宽度，则需要在中间插入一个空格
             char1 = char
             char2 = span['chars'][span['chars'].index(char) + 1] if span['chars'].index(char) + 1 < len(span['chars']) else None
-            if char2 and char2['bbox'][0] - char1['bbox'][2] > median_width * 0.25 and char['char'] != ' ' and char2['char'] != ' ':
-                content += f"{char['char']} "
+            if not return_word_box and char2 and char2['bbox'][0] - char1['bbox'][2] > median_width * 0.25 and char['char'] != ' ' and char2['char'] != ' ':
+                new_char = f"{char['char']} "
             else:
-                content += char['char']
+                new_char = char['char']
+            content += new_char
+            if return_word_box:
+                word_result.append((new_char, 1 , pdf_txt_bbox_to_table_ocr_bbox(char['bbox'].bbox, useful_list, scale)))
 
         content = __replace_unicode(content)
         content = __replace_ligatures(content)
         content = __replace_ligatures(content)
         span['content'] = content.strip()
-
+        if return_word_box:
+            span['word_result'] = word_result
     del span['chars']
+
+
+"""pdf_text bbox转为相对表格的坐标"""
+def pdf_txt_bbox_to_table_ocr_bbox(bbox, useful_list, scale):
+    paste_x, paste_y, xmin, ymin, xmax, ymax, new_width, new_height = useful_list
+
+    bbox = [bbox[0]*scale, bbox[1]*scale, bbox[2]*scale, bbox[3]*scale]
+    # bbox = [bbox[0], bbox[1], bbox[2], bbox[3]]
+    p1 = [bbox[0] + paste_x - xmin, bbox[1] + paste_y - ymin]
+    p2 = [bbox[2] + paste_x - xmin, bbox[1] + paste_y - ymin]
+    p3 = [bbox[2] + paste_x - xmin, bbox[3] + paste_y - ymin]
+    p4 = [bbox[0] + paste_x - xmin, bbox[3] + paste_y - ymin]
+    bbox = [p1, p2, p3, p4]
+    return bbox
 
 
 def calculate_contrast(img, img_mode) -> float:

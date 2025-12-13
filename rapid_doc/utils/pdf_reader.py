@@ -9,7 +9,7 @@ from pypdfium2 import PdfBitmap, PdfDocument, PdfPage
 
 def page_to_image(
     page: PdfPage,
-    dpi: int = 200,
+    dpi: int = 200, # changed from 200 to 144 （200会导致版面识别结果偶尔不准，在rapid_layout处理）
     max_width_or_height: int = 3500,  # changed from 4500 to 3500
 ) -> (Image.Image, float):
     scale = dpi / 72

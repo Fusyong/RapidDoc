@@ -1,25 +1,32 @@
-import time
+from typing import List, Dict, Any
+
+from rapid_doc.model.ocr.ocr_patch import apply_ocr_patch
+
+# 应用所有 OCR 相关补丁
+apply_ocr_patch()
+
+import os
 import cv2
 import copy
+import time
+import warnings
 import numpy as np
+from pathlib import Path
 from loguru import logger
 from rapidocr import RapidOCR, EngineType, OCRVersion, ModelType
 from rapidocr.ch_ppocr_rec import TextRecInput, TextRecOutput
-from rapidocr.ch_ppocr_det import TextDetector
-from rapidocr.ch_ppocr_det.utils import DetPreProcess
 from tqdm import tqdm
 
 from rapid_doc.utils.config_reader import get_device
+from rapid_doc.utils.model_utils import check_openvino
 from rapid_doc.utils.ocr_utils import check_img, preprocess_image, sorted_boxes, merge_det_boxes, update_det_boxes, get_rotate_crop_image
-import warnings
-
-# 定义新的方法实现
-def new_get_preprocess(self, max_wh: int) -> DetPreProcess:
-    limit_side_len = self.limit_side_len
-    return DetPreProcess(limit_side_len, self.limit_type, self.mean, self.std)
-
-# 绑定到类上，覆盖原方法
-TextDetector.get_preprocess = new_get_preprocess
+from rapidocr.inference_engine.base import InferSession
+models_dir = os.getenv('RAPID_MODELS_DIR', None)
+if models_dir:
+    # 从指定的文件夹内寻找模型文件
+    InferSession.DEFAULT_MODEL_PATH = Path(models_dir)
+    from rapidocr.ch_ppocr_rec import main as rec_main
+    rec_main.DEFAULT_MODEL_PATH = Path(models_dir)
 
 class RapidOcrModel(object):
     def __init__(self, det_db_box_thresh=0.3, lang=None, ocr_config=None, use_dilation=True, det_db_unclip_ratio=1.8, enable_merge_det_boxes=True):
@@ -28,6 +35,7 @@ class RapidOcrModel(object):
         device = get_device()
         # 默认配置
         default_params = {
+            "Global.use_cls": False,
             "engine_type": EngineType.ONNXRUNTIME,
             "Det.engine_type": EngineType.ONNXRUNTIME,
             "Rec.engine_type": EngineType.ONNXRUNTIME,
@@ -48,10 +56,12 @@ class RapidOcrModel(object):
         engine_type = ocr_config.get('engine_type') if ocr_config else None
 
         # CPU 上优先使用 OpenVINO（如果可用且用户未指定 engine_type）
-        if device.startswith('cpu') and self.check_openvino() and not engine_type:
+        if device.startswith('cpu') and check_openvino() and not engine_type:
             default_params["Det.engine_type"] = EngineType.OPENVINO
             default_params["Rec.engine_type"] = EngineType.OPENVINO
-            default_params["Cls.engine_type"] = EngineType.OPENVINO
+        if engine_type == EngineType.TORCH:
+            default_params["Det.engine_type"] = EngineType.TORCH
+            default_params["Rec.engine_type"] = EngineType.TORCH
 
         # 如果传入了 ocr_config，则覆盖参数
         if ocr_config is not None:
@@ -64,34 +74,24 @@ class RapidOcrModel(object):
                 default_params["Det.engine_type"] = EngineType.TORCH
                 default_params["Rec.engine_type"] = EngineType.TORCH
             gpu_id = int(device.split(':')[1]) if ':' in device else 0 # GPU 编号
-            if default_params.get('Det.engine_type') == EngineType.ONNXRUNTIME:
-                default_params['EngineConfig.onnxruntime.use_cuda'] = True
-                default_params['EngineConfig.onnxruntime.cuda_ep_cfg.device_id'] = gpu_id
-                # default_params['EngineConfig.onnxruntime.cuda_ep_cfg.cudnn_conv_algo_search'] = "DEFAULT"
-            elif default_params.get('Det.engine_type') == EngineType.TORCH:
+            if default_params.get('Det.engine_type') == EngineType.TORCH:
                 default_params['EngineConfig.torch.use_cuda'] = True
                 default_params['EngineConfig.torch.gpu_id'] = gpu_id
-            elif default_params.get('Det.engine_type') == EngineType.PADDLE:
-                default_params['EngineConfig.paddle.use_cuda'] = True
-                default_params['EngineConfig.paddle.gpu_id'] = gpu_id
+        elif device.startswith('npu'):
+            if not engine_type:
+                # npu 环境默认使用 torch
+                default_params["Det.engine_type"] = EngineType.TORCH
+                default_params["Rec.engine_type"] = EngineType.TORCH
+            npu_id = int(device.split(':')[1]) if ':' in device else 0  # npu 编号
+            if default_params.get('Det.engine_type') == EngineType.TORCH:
+                default_params['EngineConfig.torch.use_npu'] = True
+                default_params['EngineConfig.torch.npu_id'] = npu_id
         default_params.pop('engine_type', None)
+        default_params.pop('use_det_mode', None)
         self.ocr_engine = RapidOCR(params=default_params)
         self.text_detector = self.ocr_engine.text_det
         self.text_recognizer = self.ocr_engine.text_rec
         self.rec_batch_num = self.text_recognizer.rec_batch_num
-
-    def check_openvino(self):
-        """
-        检查当前环境是否支持 OpenVINO
-        """
-        try:
-            from openvino.runtime import Core
-            core = Core()
-            devices = core.available_devices
-            return bool(devices)
-        except Exception as e:
-            print(f"OpenVINO 可用性检查出错: {e}")
-            return False
 
     def ocr(self,
             img,
@@ -100,6 +100,9 @@ class RapidOcrModel(object):
             mfd_res=None,
             tqdm_enable=False,
             tqdm_desc="OCR-rec Predict",
+            return_word_box=False,
+            ori_img=None,
+            dt_boxes=None,
             ):
         assert isinstance(img, (np.ndarray, list, str, bytes))
         if isinstance(img, list) and det == True:
@@ -148,12 +151,68 @@ class RapidOcrModel(object):
                     if not isinstance(img, list):
                         img = preprocess_image(img)
                         img = [img]
-                    rec_input = TextRecInput(img=img, return_word_box=False)
+                    rec_input = TextRecInput(img=img, return_word_box=return_word_box)
                     rec_result = self.text_recognizer_call(rec_input, tqdm_enable=tqdm_enable, tqdm_desc=tqdm_desc)
-                    rec_res = list(zip(rec_result.txts, rec_result.scores))
+                    if return_word_box and ori_img is not None and dt_boxes:
+                        op_record = {'padding_1': {'left': 0, 'top': 0}, 'preprocess': {'ratio_h': 1.0, 'ratio_w': 1.0}}
+                        raw_h, raw_w = ori_img.shape[:2]
+                        dt_boxes_np = [np.array(box, dtype=np.float32) for box in dt_boxes]
+                        word_results = self.calc_word_boxes(img, dt_boxes_np, rec_result, op_record, raw_h, raw_w)
+                        rec_res = list(zip(rec_result.txts, rec_result.scores, word_results))
+                    else:
+                        rec_res = list(zip(rec_result.txts, rec_result.scores))
                     ocr_res.append(rec_res)
                 return ocr_res
 
+    def calc_word_boxes(
+        self,
+        img: List[np.ndarray],
+        dt_boxes: np.ndarray,
+        rec_res: TextRecOutput,
+        op_record: Dict[str, Any],
+        raw_h: int,
+        raw_w: int,
+    ) -> Any:
+        rec_res = self.ocr_engine.cal_rec_boxes(
+            img, dt_boxes, rec_res, self.ocr_engine.return_single_char_box
+        )
+
+        origin_words = []
+        for word_line in rec_res.word_results:
+            origin_words_item = []
+            for txt, score, bbox in word_line:
+                if bbox is None:
+                    continue
+
+                origin_words_points = self.map_boxes_to_original(
+                    np.array([bbox]).astype(np.float64), op_record, raw_h, raw_w
+                )
+                origin_words_points = origin_words_points.astype(np.int32).tolist()[0]
+                origin_words_item.append((txt, score, origin_words_points))
+
+            if origin_words_item:
+                origin_words.append(tuple(origin_words_item))
+        return tuple(origin_words)
+
+    def map_boxes_to_original(
+            self, dt_boxes: np.ndarray, op_record: Dict[str, Any], ori_h: int, ori_w: int
+    ) -> np.ndarray:
+        for op in reversed(list(op_record.keys())):
+            v = op_record[op]
+            if "padding" in op:
+                top, left = v.get("top"), v.get("left")
+                dt_boxes[:, :, 0] -= left
+                dt_boxes[:, :, 1] -= top
+            elif "preprocess" in op:
+                ratio_h = v.get("ratio_h")
+                ratio_w = v.get("ratio_w")
+                dt_boxes[:, :, 0] *= ratio_w
+                dt_boxes[:, :, 1] *= ratio_h
+
+        dt_boxes = np.where(dt_boxes < 0, 0, dt_boxes)
+        dt_boxes[..., 0] = np.where(dt_boxes[..., 0] > ori_w, ori_w, dt_boxes[..., 0])
+        dt_boxes[..., 1] = np.where(dt_boxes[..., 1] > ori_h, ori_h, dt_boxes[..., 1])
+        return dt_boxes
 
     def __call__(self, img, mfd_res=None):
 

@@ -3,15 +3,15 @@ import time
 from typing import List, Tuple
 from PIL import Image
 from loguru import logger
-import pypdfium2 as pdfium
 
 from .model_init import MineruPipelineModel
-from rapid_doc.utils.config_reader import get_device
+from ...utils.config_reader import get_device
 from ...utils.enum_class import ImageType
+from ...utils.hash_utils import make_hashable
 from ...utils.pdf_classify import classify
-from ...utils.pdf_image_tools import load_images_from_pdf
+from ...utils.pdf_image_tools import load_images_from_pdf, get_ori_image
 from ...utils.model_utils import get_vram, clean_memory
-
+from ...utils.pdf_text_tool import get_page
 
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # 让mps可以fallback
 os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'  # 禁止albumentations检查更新
@@ -35,7 +35,7 @@ class ModelSingleton:
         formula_config=None,
         table_config=None,
     ):
-        key = (lang, formula_enable, table_enable)
+        key = (lang, formula_enable, table_enable, make_hashable(layout_config), make_hashable(ocr_config), make_hashable(formula_config), make_hashable(table_config))
         if key not in self._models:
             self._models[key] = custom_model_init(
                 lang=lang,
@@ -88,7 +88,7 @@ def custom_model_init(
 
 def doc_analyze(
         pdf_bytes_list,
-        lang_list,
+        lang_list: list[str] = None,
         parse_method: str = 'auto',
         formula_enable=True,
         table_enable=True,
@@ -102,6 +102,8 @@ def doc_analyze(
     适当调大MIN_BATCH_INFERENCE_SIZE可以提高性能，更大的 MIN_BATCH_INFERENCE_SIZE会消耗更多内存，
     可通过环境变量MINERU_MIN_BATCH_INFERENCE_SIZE设置，默认值为384。
     """
+    if lang_list is None:
+        lang_list = ["ch"] * len(pdf_bytes_list)
     min_batch_inference_size = int(os.environ.get('MINERU_MIN_BATCH_INFERENCE_SIZE', 384))
 
     # 收集所有页面信息
@@ -123,19 +125,33 @@ def doc_analyze(
         _lang = lang_list[pdf_idx]
 
         # 收集每个数据集中的页面
-        images_list, pdf_doc = load_images_from_pdf(pdf_bytes, image_type=ImageType.PIL)
+        # load_images_start = time.time()
+        images_list, pdf_doc_list = load_images_from_pdf(pdf_bytes, image_type=ImageType.PIL)
+        # load_images_time = round(time.time() - load_images_start, 2)
+        # speed = len(images_list) / (load_images_time + 1e-6)
+        # logger.info(f"load images cost: {round(load_images_time, 4)}, speed: {round(speed, 3)} images/s")
         all_image_lists.append(images_list)
-        all_pdf_docs.append(pdf_doc)
+
+        all_pdf_dict = []
+        for pdf_doc in pdf_doc_list:
+            # 获取pdf的文字和图片的字典对象
+            page_dict = get_page(pdf_doc)
+            if page_dict['blocks']:
+                page_dict['ori_image_list'] = get_ori_image(pdf_doc) # 从 PDF 中提取所有原始图片
+            else:
+                page_dict['ori_image_list'] = [] # 提取不到文字视为扫描版，不需要提取图片
+            pdf_doc.close()
+            all_pdf_dict.append(page_dict)
+        all_pdf_docs.append(all_pdf_dict)
         for page_idx in range(len(images_list)):
             img_dict = images_list[page_idx]
             all_pages_info.append((
                 pdf_idx, page_idx,
-                img_dict['img_pil'], _ocr_enable, _lang,
+                img_dict['img_pil'], img_dict['scale'], _ocr_enable, _lang,
             ))
 
     # 准备批处理
-    # 把 pdf_doc 传进去，尝试直接读取pdf表格文本和表格结构
-    images_with_extra_info = [(info[2], info[3], info[4], all_pdf_docs[info[0]][info[1]]) for info in all_pages_info]
+    images_with_extra_info = [(info[2], info[3], info[4], info[5], all_pdf_docs[info[0]][info[1]]) for info in all_pages_info]
     batch_size = min_batch_inference_size
     batch_images = [
         images_with_extra_info[i:i + batch_size]
@@ -161,7 +177,7 @@ def doc_analyze(
         infer_results.append([])
 
     for i, page_info in enumerate(all_pages_info):
-        pdf_idx, page_idx, pil_img, _, _ = page_info
+        pdf_idx, page_idx, pil_img, _, _, _ = page_info
         result = results[i]
 
         page_info_dict = {'page_no': page_idx, 'width': pil_img.width, 'height': pil_img.height}
@@ -173,7 +189,7 @@ def doc_analyze(
 
 
 def batch_image_analyze(
-        images_with_extra_info: List[Tuple[Image.Image, bool, str, pdfium.PdfPage]],
+        images_with_extra_info: List[Tuple[Image.Image, float, bool, str, dict]],
         formula_enable=True,
         table_enable=True,
         layout_config=None,
@@ -201,8 +217,12 @@ def batch_image_analyze(
             ) from e
 
     if str(device).startswith('npu') or str(device).startswith('cuda'):
-        vram = get_vram(device)
-        if vram is not None:
+        if str(device).startswith('npu'):
+            # onnxruntime-cann要在torch-npu之前初始化
+            vram = int(os.getenv('MINERU_VIRTUAL_VRAM_SIZE', -1))
+        else:
+            vram = get_vram(device)
+        if vram is not None and vram > 0:
             gpu_memory = int(os.getenv('MINERU_VIRTUAL_VRAM_SIZE', round(vram)))
             if gpu_memory >= 16:
                 batch_ratio = 16
@@ -220,13 +240,6 @@ def batch_image_analyze(
             batch_ratio = 1
             logger.info(f'Could not determine GPU memory, using default batch_ratio: {batch_ratio}')
 
-    # # 检测torch的版本号
-    # import torch
-    # from packaging import version
-    # if version.parse(torch.__version__) >= version.parse("2.8.0") or str(device).startswith('mps'):
-    #     enable_ocr_det_batch = False
-    # else:
-    #     enable_ocr_det_batch = True
     enable_ocr_det_batch = True
     batch_model = BatchAnalyze(model_manager, batch_ratio, formula_enable, table_enable, enable_ocr_det_batch, layout_config, ocr_config, formula_config, table_config, checkbox_config)
     results = batch_model(images_with_extra_info)

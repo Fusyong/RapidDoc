@@ -1,3 +1,5 @@
+import math
+
 from rapid_doc.utils.boxbase import bbox_relative_pos, calculate_iou, bbox_distance, get_minbox_if_overlap_by_ratio
 from rapid_doc.utils.enum_class import CategoryId, ContentType
 from rapid_doc.utils.magic_model_utils import tie_up_category_by_distance_v3, reduct_overlap
@@ -77,10 +79,15 @@ class MagicModel:
         for layout_det in layout_dets:
             x0, y0, _, _, x1, y1, _, _ = layout_det['poly']
             bbox = [
-                int(x0 / self.__scale),
-                int(y0 / self.__scale),
-                int(x1 / self.__scale),
-                int(y1 / self.__scale),
+                # int(x0 / self.__scale),
+                # int(y0 / self.__scale),
+                # int(x1 / self.__scale),
+                # int(y1 / self.__scale),
+                # 取整会导致截取的图片边界有的不准，保留两位小数，第三位舍弃
+                math.floor(x0 / self.__scale * 100) / 100,
+                math.floor(y0 / self.__scale * 100) / 100,
+                math.floor(x1 / self.__scale * 100) / 100,
+                math.floor(y1 / self.__scale * 100) / 100,
             ]
             layout_det['bbox'] = bbox
             # 删除高度或者宽度小于等于0的spans
@@ -215,7 +222,7 @@ class MagicModel:
             return reduct_overlap(
                 list(
                     map(
-                        lambda x: {'bbox': x['bbox'], 'score': x['score']},
+                        lambda x: {'bbox': x['bbox'], 'score': x['score'], 'original_label': x.get('original_label')},
                         filter(
                             lambda x: x['category_id'] == subject_category_id,
                             self.__page_model_info['layout_dets'],
@@ -228,7 +235,7 @@ class MagicModel:
             return reduct_overlap(
                 list(
                     map(
-                        lambda x: {'bbox': x['bbox'], 'score': x['score']},
+                        lambda x: {'bbox': x['bbox'], 'score': x['score'], 'original_label': x.get('original_label')},
                         filter(
                             lambda x: x['category_id'] == object_category_id,
                             self.__page_model_info['layout_dets'],
@@ -339,6 +346,10 @@ class MagicModel:
                         span['latex'] = latex
                     elif html:
                         span['html'] = html
+                        if layout_det.get('latex_boxes'):
+                            span['latex_boxes'] = layout_det.get('latex_boxes')
+                        elif layout_det.get('img_boxes'):
+                            span['img_boxes'] = layout_det.get('img_boxes')
                     span['type'] = ContentType.TABLE
                 # elif category_id == CategoryId.InlineEquation:
                 #     span['content'] = layout_det['latex']
@@ -362,6 +373,7 @@ class MagicModel:
                 elif category_id == CategoryId.OcrText:
                     span['content'] = layout_det['text']
                     span['type'] = ContentType.TEXT
+                span['original_label'] = layout_det.get('original_label')
                 all_spans.append(span)
         return remove_duplicate_spans(all_spans)
 

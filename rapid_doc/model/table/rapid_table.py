@@ -1,18 +1,15 @@
-import html
-
 import cv2
 import numpy as np
 from loguru import logger
 
+from rapid_doc.backend.pipeline.pipeline_middle_json_mkcontent import inline_left_delimiter, inline_right_delimiter
 from rapid_doc.model.table.rapid_table_self.table_cls import TableCls
-from rapid_doc.model.table.rapid_table_self import ModelType, RapidTable, RapidTableInput
-from rapid_doc.model.layout.rapid_layout_self import RapidLayoutInput, RapidLayout, ModelType as LayoutModelType
+from rapid_doc.model.table.rapid_table_self import ModelType, RapidTable, RapidTableInput, EngineType
+from rapid_doc.model.table.utils import select_best_table_model
+from rapid_doc.utils.boxbase import is_in
 from rapid_doc.utils.config_reader import get_device
-
-
-def escape_html(input_string):
-    """Escape HTML Entities."""
-    return html.escape(input_string)
+from rapid_doc.utils.model_utils import check_openvino
+from rapid_doc.utils.ocr_utils import points_to_bbox, bbox_to_points
 
 
 class RapidTableModel(object):
@@ -24,58 +21,58 @@ class RapidTableModel(object):
         if device.startswith('cuda'):
             device_id = int(device.split(':')[1]) if ':' in device else 0  # GPU 编号
             engine_cfg = {'use_cuda': True, "cuda_ep_cfg.device_id": device_id}
+        elif device.startswith('npu'):
+            device_id = int(device.split(':')[1]) if ':' in device else 0  # npu 编号
+            engine_cfg = {'use_cann': True, "cann_ep_cfg.device_id": device_id}
+        engine_cfg = engine_cfg or {}
+        # 如果传入了 engine_cfg，则覆盖参数
+        if table_config.get('engine_cfg'):
+            engine_cfg = table_config.get('engine_cfg')
+        self.use_compare_table = table_config.get('use_compare_table') if table_config else False
         self.model_type = table_config.get("model_type", ModelType.UNET_SLANET_PLUS)
         self.ocr_engine = ocr_engine
 
-        if self.model_type == ModelType.SLANEXT:
-            # 有线/无线 单元格识别
-            self.table_cls = TableCls(model_path=table_config.get("cls.model_dir_or_path"))
-            wired_cell_args = RapidLayoutInput(model_type=LayoutModelType.RT_DETR_L_WIRED_TABLE_CELL_DET,
-                                               model_dir_or_path=table_config.get("wired_cell.model_dir_or_path"),
-                                               conf_thresh=0.3,
-                                               engine_cfg=engine_cfg or {}, )
-            self.wired_table_cell = RapidLayout(cfg=wired_cell_args)
-            wireless_cell_args = RapidLayoutInput(model_type=LayoutModelType.RT_DETR_L_WIRELESS_TABLE_CELL_DET,
-                                                  model_dir_or_path=table_config.get("wireless_cell.model_dir_or_path"),
-                                                  conf_thresh=0.3,
-                                                  engine_cfg=engine_cfg or {}, )
-            self.wireless_table_cell = RapidLayout(cfg=wireless_cell_args)
-            # 有线/无线 表结构识别
-            wired_input_args = RapidTableInput(model_type=ModelType.SLANEXT_WIRED, use_ocr=False,
-                                               model_dir_or_path=table_config.get("wired_table.model_dir_or_path"),
-                                               engine_cfg=engine_cfg or {},)
-            self.wired_table_model = RapidTable(wired_input_args)
-            wireless_input_args = RapidTableInput(model_type=ModelType.SLANEXT_WIRELESS, use_ocr=False,
-                                                  model_dir_or_path=table_config.get("wireless_table.model_dir_or_path"),
-                                                  engine_cfg=engine_cfg or {},)
-            self.wireless_table_model = RapidTable(wireless_input_args)
-        elif self.model_type == ModelType.UNET_SLANET_PLUS:
-            self.table_cls = TableCls(model_path=table_config.get("cls.model_dir_or_path"))
-            wired_input_args = RapidTableInput(model_type=ModelType.UNET, use_ocr=False,
+        # 获取用户传入的 engine_type
+        self.engine_type = table_config.get('engine_type') if table_config else None
+        # CPU 上优先使用 OpenVINO（如果可用且用户未指定 engine_type）
+        if device.startswith('cpu') and check_openvino() and not self.engine_type:
+            self.engine_type = EngineType.OPENVINO
+
+        if self.model_type == ModelType.UNET_SLANET_PLUS:
+            cls_input_args = RapidTableInput(model_type=table_config.get("cls.model_type", ModelType.Q_CLS), engine_type=self.engine_type,
+                                            model_dir_or_path=table_config.get("cls.model_dir_or_path"),
+                                            engine_cfg=engine_cfg, use_ocr=False)
+            self.table_cls = TableCls(cls_input_args)
+            wired_input_args = RapidTableInput(model_type=ModelType.UNET, engine_type=self.engine_type,
                                                model_dir_or_path=table_config.get("unet.model_dir_or_path"),
-                                               engine_cfg=engine_cfg or {}, )
+                                               engine_cfg=engine_cfg, use_ocr=False)
             self.wired_table_model = RapidTable(wired_input_args)
-            wireless_input_args = RapidTableInput(model_type=ModelType.SLANETPLUS, use_ocr=False,
+            wireless_input_args = RapidTableInput(model_type=ModelType.SLANETPLUS, engine_type=self.engine_type,
                                                   model_dir_or_path=table_config.get("slanet_plus.model_dir_or_path"),
-                                                  engine_cfg=engine_cfg or {}, )
+                                                  engine_cfg=engine_cfg, use_ocr=False)
             self.wireless_table_model = RapidTable(wireless_input_args)
         elif self.model_type == ModelType.UNET_UNITABLE:
-            self.table_cls = TableCls(model_path=table_config.get("cls.model_dir_or_path"))
-            wired_input_args = RapidTableInput(model_type=ModelType.UNET, use_ocr=False,
+            cls_input_args = RapidTableInput(model_type=table_config.get("cls.model_type", ModelType.Q_CLS), engine_type=self.engine_type,
+                                            model_dir_or_path=table_config.get("cls.model_dir_or_path"),
+                                            engine_cfg=engine_cfg, use_ocr=False)
+            self.table_cls = TableCls(cls_input_args)
+            wired_input_args = RapidTableInput(model_type=ModelType.UNET, engine_type=self.engine_type,
                                                model_dir_or_path=table_config.get("unet.model_dir_or_path"),
-                                               engine_cfg=engine_cfg or {}, )
+                                               engine_cfg=engine_cfg, use_ocr=False)
             self.wired_table_model = RapidTable(wired_input_args)
-            wireless_input_args = RapidTableInput(model_type=ModelType.UNITABLE, use_ocr=False,
+            wireless_input_args = RapidTableInput(model_type=ModelType.UNITABLE, engine_type=EngineType.TORCH,
                                                   model_dir_or_path=table_config.get("unitable.model_dir_or_path"),
-                                                  engine_cfg=engine_cfg or {}, )
+                                                  engine_cfg=engine_cfg, use_ocr=False)
             self.wireless_table_model = RapidTable(wireless_input_args)
         else:
-            input_args = RapidTableInput(model_type=self.model_type, use_ocr=False,
+            if self.model_type == ModelType.UNITABLE:
+                self.engine_type = EngineType.TORCH
+            input_args = RapidTableInput(model_type=self.model_type, engine_type=self.engine_type,
                                          model_dir_or_path=table_config.get("model_dir_or_path"),
-                                         engine_cfg=engine_cfg or {},)
+                                         engine_cfg=engine_cfg, use_ocr=False)
             self.table_model = RapidTable(input_args)
 
-    def predict(self, image, ocr_result=None):
+    def predict(self, image, ocr_result=None, fill_image_res=None, mfd_res=None, skip_text_in_image=True, use_img2table=False):
         bgr_image = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
 
         # First check the overall image aspect ratio (height/width)
@@ -121,63 +118,104 @@ class RapidTableModel(object):
 
         # Continue with OCR on potentially rotated image
         if not ocr_result:
-            ocr_result = self.ocr_engine.ocr(bgr_image)[0]
+            ocr_result = self.ocr_engine.ocr(bgr_image, mfd_res=mfd_res)[0]
             if ocr_result:
                 ocr_result = [list(x) for x in zip(*[[item[0], item[1][0], item[1][1]] for item in ocr_result])]
             else:
                 ocr_result = None
 
-
-        if ocr_result:
-            # # TODO 先尝试快速的 img2table 方案
-            # from io import BytesIO
-            # from img2table.document import Image
-            # from rapid_doc.model.table.RapidOcrTable import RapidOcrTable
-            # try:
-            #     opencv_ocr = RapidOcrTable(ocr_result)
-            #     _, buffer = cv2.imencode(".jpg", bgr_image)
-            #     doc = Image(src=BytesIO(buffer))
-            #     extracted_tables = doc.extract_tables(
-            #         ocr=opencv_ocr,
-            #         implicit_rows=False,
-            #         implicit_columns=False,
-            #         borderless_tables=False,
-            #         min_confidence=50
-            #     )
-            #     if extracted_tables:
-            #         print(f"img2table detected {len(extracted_tables)} tables")
-            #         html_code = "<html><body>" + extracted_tables[0].html + "</body></html>"
-            #         return html_code, None, None, None
-            # except Exception as e:
-            #     print(f"img2table processing failed: {str(e)}")
-
-            try:
-                image = np.asarray(image)
-                if self.model_type == ModelType.SLANEXT:
-                    cls, elasp = self.table_cls(image)
-                    if cls == "wired":
-                        cell_res = self.wired_table_cell([image])
-                        model_runner = (self.wired_table_model)
-                    else:  # wireless
-                        cell_res = self.wireless_table_cell([image])
-                        model_runner = (self.wireless_table_model)
-                    cell_results = (cell_res[0].boxes, cell_res[0].scores)
-                    table_results = model_runner(image, ocr_result, cell_results=cell_results)
-                elif self.model_type == ModelType.UNET_SLANET_PLUS or self.model_type == ModelType.UNET_UNITABLE:
-                    cls, elasp = self.table_cls(image)
-                    if cls == "wired":
-                        table_results = self.wired_table_model(image, ocr_result)
-                    else:  # wireless
-                        table_results = self.wireless_table_model(image, ocr_result)
+        if not ocr_result:
+            return None
+        # 把图片结果，添加到ocr_result里。uuid作为占位符，后面保存图片时替换
+        if fill_image_res:
+            for fill_image in fill_image_res:
+                bbox = points_to_bbox(fill_image['ocr_bbox'])
+                cv2.rectangle(bgr_image, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (255, 255, 255), thickness=-1) # 填白图像区域，防止表格识别被影响
+                ocr_result[0].append(fill_image['ocr_bbox'])
+                ocr_result[1].append(fill_image['uuid'])
+                ocr_result[2].append(1)
+                if skip_text_in_image:
+                    # 找出所有 OCR 框在图片框内的下标
+                    delete_indices = []
+                    for idx, ocr in enumerate(ocr_result[0][:-1]):  # 排除刚添加的图片框自身
+                        if is_in(points_to_bbox(ocr), points_to_bbox(fill_image['ocr_bbox'])):
+                            delete_indices.append(idx)
+                    # 按逆序删除，防止下标错位
+                    for idx in sorted(delete_indices, reverse=True):
+                        del ocr_result[0][idx]
+                        del ocr_result[1][idx]
+                        del ocr_result[2][idx]
+        # 表格内的公式填充
+        if mfd_res:
+            for mfd in mfd_res:
+                if mfd.get('latex'):
+                    ocr_result[1].append(f"{inline_left_delimiter}{mfd['latex']}{inline_right_delimiter}")
+                elif mfd.get('checkbox'):
+                    ocr_result[1].append(mfd['checkbox'])
                 else:
-                    table_results = self.table_model(image, ocr_result)
+                    continue
+                ocr_result[0].append(bbox_to_points(mfd['bbox']))
+                ocr_result[2].append(1)
 
-                html_code = table_results.pred_html
-                table_cell_bboxes = table_results.cell_bboxes
-                logic_points = table_results.logic_points
-                elapse = table_results.elapse
-                return html_code, table_cell_bboxes, logic_points, elapse
+        """开始识别表格"""
+        cls = None
+        """使用 img2table 识别"""
+        if use_img2table:
+            try:
+                from rapid_doc.model.table.img2table_self.image import Image
+                from rapid_doc.model.table.img2table_self.RapidOcrTable import RapidOcrTable
+
+                cls, elasp = self.table_cls(image)
+                cls = cls[0]
+                if cls == "wired":
+                    borderless_tables = False
+                else:
+                    borderless_tables = True
+                opencv_ocr = RapidOcrTable(ocr_result)
+                doc = Image(src=bgr_image)
+                extracted_tables = doc.extract_tables(
+                    ocr=opencv_ocr,
+                    implicit_rows=False,
+                    implicit_columns=False,
+                    borderless_tables=borderless_tables,
+                    min_confidence=50
+                )
+                if extracted_tables:
+                    # print(f"img2table detected {len(extracted_tables)} tables")
+                    html_code = "<html><body>" + extracted_tables[0].html + "</body></html>"
+                    return html_code
+            except ImportError:
+                raise ValueError(
+                    "Could not import img2table python package. "
+                    "Please install it with `pip install img2table`."
+                )
             except Exception as e:
                 logger.exception(e)
 
-        return None, None, None, None
+        """使用 rapid_table_self 识别"""
+        try:
+            ocr_result = [ocr_result]
+            bgr_image = [bgr_image]
+
+            if self.model_type == ModelType.UNET_SLANET_PLUS or self.model_type == ModelType.UNET_UNITABLE:
+                if not cls:
+                    cls, elasp = self.table_cls(bgr_image)
+                    cls = cls[0]
+                if cls == "wired":
+                    wired_pred = self.wired_table_model(bgr_image, ocr_result).pred_htmls
+                    wired_html_code = wired_pred[0] if len(wired_pred) > 0 else None
+                    if self.use_compare_table:
+                        wireless_pred = self.wireless_table_model(bgr_image, ocr_result).pred_htmls
+                        wireless_html_code = wireless_pred[0] if len(wireless_pred) > 0 else None
+                        html_code = select_best_table_model(ocr_result[0], wired_html_code, wireless_html_code)
+                    else:
+                        html_code = wired_html_code
+                else:  # wireless
+                    html = self.wireless_table_model(bgr_image, ocr_result).pred_htmls
+                    html_code = html[0] if len(html) > 0 else None
+            else:
+                html_code = self.table_model(bgr_image, ocr_result).pred_htmls[0]
+            return html_code
+        except Exception as e:
+            logger.exception(e)
+            return None
