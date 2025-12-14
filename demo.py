@@ -230,6 +230,7 @@ if __name__ == '__main__':
         "demo/pdfs/示例1-论文模板.pdf",
         "demo/pdfs/比亚迪财报.pdf",
         "demo/images/table_10.png",
+        # "demo/mypdf/学探诊六上.pdf",
     ]
     for doc_path in doc_path_list:
         start_time = time.time()

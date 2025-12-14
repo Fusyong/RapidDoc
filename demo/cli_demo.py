@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import time
 from pathlib import Path
 # # 使用默认 GPU（cuda:0）
 # os.environ['MINERU_DEVICE_MODE'] = "cuda"
@@ -16,7 +17,7 @@ from rapid_doc.data.data_reader_writer import FileBasedDataWriter
 from rapid_doc.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
 from rapid_doc.utils.enum_class import MakeMode
 from rapid_doc.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
-from rapid_doc.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
+from rapid_doc.backend.pipeline.pipeline_middle_json_mkcontent_with_footnote import union_make as pipeline_union_make
 from rapid_doc.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
 
 from rapidocr import EngineType as OCREngineType, OCRVersion, ModelType as OCRModelType
@@ -41,25 +42,27 @@ def do_parse(
     f_make_md_mode=MakeMode.MM_MD,  # The mode for making markdown content, default is MM_MD
     start_page_id=0,  # Start page ID for parsing, default is 0
     end_page_id=None,  # End page ID for parsing, default is None (parse all pages until the end of the document)
+    f_include_footnotes=True,  # Whether to include footnotes in markdown output, default is True
+    f_include_page_numbers=True,  # Whether to include page number markers in markdown output, default is True
 ):
 
 
     layout_config = {
-        "model_type": LayoutModelType.PP_DOCLAYOUT_PLUS_L,
+        # "model_type": LayoutModelType.PP_DOCLAYOUT_PLUS_L,
         # "conf_thresh": 0.4,
-        # "batch_num": 1,
+        "batch_num": 1,
         # "model_dir_or_path": "C:\ocr\models\ppmodel\layout\PP-DocLayout-L\pp_doclayout_l.onnx"
     }
 
     ocr_config = {
         # "Det.model_path": r"C:\ocr\models\ppmodel\ocr\v4\ch_PP-OCRv4_det_infer\openvino\ch_PP-OCRv4_det_infer.onnx",
         # "Rec.model_path": r"C:\ocr\models\ppmodel\ocr\v4\ch_PP-OCRv4_rec_infer\openvino\ch_PP-OCRv4_rec_infer.onnx",
-        # "Rec.rec_batch_num": 1,
+        "Rec.rec_batch_num": 2,  # 设置较小的批处理大小以避免内存不足
 
         # "Det.ocr_version": OCRVersion.PPOCRV5,
         # "Rec.ocr_version": OCRVersion.PPOCRV5,
-        # "Det.model_type": OCRModelType.SERVER,
-        # "Rec.model_type": OCRModelType.SERVER,
+        "Det.model_type": OCRModelType.MOBILE, # MOBILE、SERVER
+        "Rec.model_type": OCRModelType.MOBILE, # MOBILE、SERVER
 
         # 新增的自定义参数
         # "engine_type": OCREngineType.TORCH, # 统一设置推理引擎
@@ -73,7 +76,7 @@ def do_parse(
         "model_type": FormulaModelType.PP_FORMULANET_PLUS_M,
         # "engine_type": FormulaEngineType.TORCH,
         # "formula_level": 1, # 公式识别等级，默认为0，全识别。1:仅识别行间公式，行内公式不识别
-        # "batch_num": 1,
+        # "batch_num": 2,
         # "model_dir_or_path": r"C:\ocr\models\ppmodel\formula\PP-FormulaNet_plus-S\pp_formulanet_plus_s.onnx",
         # "dict_keys_path": "D:\CodeProjects\doc\RapidAI\pp_formulanet_plus_m_inference.yml", #yml字典路径（torch使用）
     }
@@ -119,6 +122,8 @@ def do_parse(
         new_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes, start_page_id, end_page_id)
         pdf_bytes_list[idx] = new_pdf_bytes
 
+    # 记录开始时间
+    start_time = time.time()
     infer_results, all_image_lists, all_page_dicts, lang_list, ocr_enabled_list = pipeline_doc_analyze(pdf_bytes_list, parse_method=parse_method, formula_enable=formula_enable,table_enable=table_enable
                                                                                                      ,layout_config=layout_config, ocr_config=ocr_config, formula_config=formula_config, table_config=table_config, checkbox_config=checkbox_config)
 
@@ -134,6 +139,8 @@ def do_parse(
         _ocr_enable = ocr_enabled_list[idx]
         middle_json = pipeline_result_to_middle_json(model_list, images_list, pdf_dict, image_writer, _lang, _ocr_enable, formula_enable, ocr_config=ocr_config, image_config=image_config)
 
+        # 计算总运行时间（单位：秒）
+        print(f"运行时间: {time.time() - start_time}秒")
         pdf_info = middle_json["pdf_info"]
 
         pdf_bytes = pdf_bytes_list[idx]
@@ -151,11 +158,18 @@ def do_parse(
 
         if f_dump_md:
             image_dir = str(os.path.basename(local_image_dir))
-            md_content_str = pipeline_union_make(pdf_info, f_make_md_mode, image_dir)
-            md_writer.write_string(
-                f"{pdf_file_name}.md",
-                md_content_str,
-            )
+            md_content_str = pipeline_union_make(
+                pdf_info,
+                f_make_md_mode,
+                image_dir,
+                include_footnotes=f_include_footnotes,
+                include_page_numbers=f_include_page_numbers
+                )
+            if md_content_str is not None:
+                md_writer.write_string(
+                    f"{pdf_file_name}.md",
+                    md_content_str if isinstance(md_content_str, str) else str(md_content_str),
+                )
 
         if f_dump_content_list:
             image_dir = str(os.path.basename(local_image_dir))
@@ -185,7 +199,9 @@ def parse_doc(
         output_dir,
         method="auto",
         start_page_id=0,
-        end_page_id=None
+        end_page_id=None,
+        f_include_footnotes=True,  # Whether to include footnotes in markdown output, default is True
+        f_include_page_numbers=True,  # Whether to include page number markers in markdown output, default is True
 ):
     """
         Parameter description:
@@ -213,7 +229,9 @@ def parse_doc(
             pdf_bytes_list=pdf_bytes_list,
             parse_method=method,
             start_page_id=start_page_id,
-            end_page_id=end_page_id
+            end_page_id=end_page_id,
+            f_include_footnotes=f_include_footnotes,
+            f_include_page_numbers=f_include_page_numbers
         )
     except Exception as e:
         logger.exception(e)
@@ -228,7 +246,7 @@ if __name__ == '__main__':
     pdf_suffixes = [".pdf"]
     image_suffixes = [".png", ".jpeg", ".jpg"]
 
-    doc_path_list = []
+    doc_path_list = ["mypdf/学探诊六上.pdf"]
 
     # 遍历 pdfs 目录
     for doc_path in Path(pdf_files_dir).glob('*'):
@@ -240,4 +258,8 @@ if __name__ == '__main__':
         if img_path.suffix.lower() in image_suffixes:
             doc_path_list.append(img_path)
 
+    start_time = time.time()
+    # parse_doc(doc_path_list, output_dir, method="txt")
+    # parse_doc(doc_path_list, output_dir, method="ocr")
     parse_doc(doc_path_list, output_dir)
+    print(f"总运行时间: {time.time() - start_time}秒")
