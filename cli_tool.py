@@ -240,6 +240,13 @@ def do_parse(
         layout_config["batch_num"] = batch_num
 
     ocr_config = {
+        # https://rapidai.github.io/RapidOCRDocs/main/model_list/
+        # "Det.ocr_version": OCRVersion.PPOCRV5,
+        # "Det.lang_type": LangDet.CH,简体中文、中文拼音、繁体中文、英文、日文
+        # "Rec.ocr_version": OCRVersion.PPOCRV5,
+        # "Rec.lang_type": LangDet.CH,简体中文、中文拼音、繁体中文、英文、日文
+        # "Rec.ocr_version": OCRVersion.PPOCRV4,
+        # "Rec.lang_type": LangDet.chinese_cht,中文繁体
         "Det.model_type": OCRModelType.MOBILE,  # MOBILE、SERVER
         "Rec.model_type": OCRModelType.MOBILE,  # MOBILE、SERVER
     }

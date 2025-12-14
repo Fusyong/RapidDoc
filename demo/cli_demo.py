@@ -50,17 +50,22 @@ def do_parse(
     layout_config = {
         # "model_type": LayoutModelType.PP_DOCLAYOUT_PLUS_L,
         # "conf_thresh": 0.4,
-        "batch_num": 1,
+        # "batch_num": 1,
         # "model_dir_or_path": "C:\ocr\models\ppmodel\layout\PP-DocLayout-L\pp_doclayout_l.onnx"
     }
 
     ocr_config = {
         # "Det.model_path": r"C:\ocr\models\ppmodel\ocr\v4\ch_PP-OCRv4_det_infer\openvino\ch_PP-OCRv4_det_infer.onnx",
         # "Rec.model_path": r"C:\ocr\models\ppmodel\ocr\v4\ch_PP-OCRv4_rec_infer\openvino\ch_PP-OCRv4_rec_infer.onnx",
-        "Rec.rec_batch_num": 2,  # 设置较小的批处理大小以避免内存不足
+        # "Rec.rec_batch_num": 1,  # 设置较小的批处理大小以避免内存不足
 
+        # https://rapidai.github.io/RapidOCRDocs/main/model_list/
         # "Det.ocr_version": OCRVersion.PPOCRV5,
+        # "Det.lang_type": LangDet.CH,简体中文、中文拼音、繁体中文、英文、日文
         # "Rec.ocr_version": OCRVersion.PPOCRV5,
+        # "Rec.lang_type": LangDet.CH,简体中文、中文拼音、繁体中文、英文、日文
+        # "Rec.ocr_version": OCRVersion.PPOCRV4,
+        # "Rec.lang_type": LangDet.chinese_cht,中文繁体
         "Det.model_type": OCRModelType.MOBILE, # MOBILE、SERVER
         "Rec.model_type": OCRModelType.MOBILE, # MOBILE、SERVER
 
