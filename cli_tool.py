@@ -18,6 +18,7 @@ from rapid_doc.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2, prepar
 from rapid_doc.data.data_reader_writer import FileBasedDataWriter
 from rapid_doc.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
 from rapid_doc.utils.enum_class import MakeMode
+from rapid_doc.utils.pdf_searchable import create_searchable_pdf
 from rapid_doc.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
 from rapid_doc.backend.pipeline.pipeline_middle_json_mkcontent_with_footnote import union_make as pipeline_union_make
 from rapid_doc.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
@@ -41,6 +42,7 @@ def parse_args():
   %(prog)s input.pdf input2.pdf -o output/ --method ocr
   %(prog)s input.pdf -o output/ --start-page 0 --end-page 10
   %(prog)s input.pdf -o output/ --no-formula --no-table
+  %(prog)s input.pdf -o output/ --searchable-pdf
         """
     )
 
@@ -176,6 +178,14 @@ def parse_args():
         help='不生成内容列表JSON文件'
     )
 
+    parser.add_argument(
+        '--searchable-pdf',
+        dest='create_searchable_pdf',
+        action='store_true',
+        default=False,  # 默认不生成可搜索PDF
+        help='生成双层可搜索PDF（在原始PDF下方添加不可见文本层）'
+    )
+
     # 日志选项
     parser.add_argument(
         '-v', '--verbose',
@@ -231,6 +241,7 @@ def do_parse(
     f_include_footnotes=True,
     f_include_page_numbers=True,
     batch_num=None,
+    f_create_searchable_pdf=False,
 ):
     """执行解析任务"""
     layout_config = {
@@ -361,6 +372,15 @@ def do_parse(
                 json.dumps(model_json, ensure_ascii=False, indent=4),
             )
 
+        if f_create_searchable_pdf:
+            logger.debug("生成双层可搜索PDF...")
+            searchable_pdf_path = os.path.join(local_md_dir, f"{pdf_file_name}_searchable.pdf")
+            success = create_searchable_pdf(pdf_bytes, middle_json, searchable_pdf_path)
+            if success:
+                logger.info(f"可搜索PDF已生成: {searchable_pdf_path}")
+            else:
+                logger.warning(f"可搜索PDF生成失败，可能需要安装PyMuPDF: pip install pymupdf")
+
         logger.info(f"输出目录: {local_md_dir}")
 
     elapsed_time = time.time() - start_time
@@ -424,6 +444,7 @@ def main():
             f_include_footnotes=args.include_footnotes,
             f_include_page_numbers=args.include_page_numbers,
             batch_num=args.batch_num,
+            f_create_searchable_pdf=args.create_searchable_pdf,
         )
         logger.info("处理完成！")
     except Exception as e:

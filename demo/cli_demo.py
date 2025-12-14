@@ -16,6 +16,7 @@ from rapid_doc.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2, prepar
 from rapid_doc.data.data_reader_writer import FileBasedDataWriter
 from rapid_doc.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
 from rapid_doc.utils.enum_class import MakeMode
+from rapid_doc.utils.pdf_searchable import create_searchable_pdf
 from rapid_doc.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
 from rapid_doc.backend.pipeline.pipeline_middle_json_mkcontent_with_footnote import union_make as pipeline_union_make
 from rapid_doc.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
@@ -44,6 +45,7 @@ def do_parse(
     end_page_id=None,  # End page ID for parsing, default is None (parse all pages until the end of the document)
     f_include_footnotes=True,  # Whether to include footnotes in markdown output, default is True
     f_include_page_numbers=True,  # Whether to include page number markers in markdown output, default is True
+    f_create_searchable_pdf=False,  # Whether to create searchable PDF with invisible text layer
 ):
 
 
@@ -195,6 +197,15 @@ def do_parse(
                 f"{pdf_file_name}_model.json",
                 json.dumps(model_json, ensure_ascii=False, indent=4),
             )
+
+        if f_create_searchable_pdf:
+            logger.debug("生成双层可搜索PDF...")
+            searchable_pdf_path = os.path.join(local_md_dir, f"{pdf_file_name}_searchable.pdf")
+            success = create_searchable_pdf(pdf_bytes, middle_json, searchable_pdf_path)
+            if success:
+                logger.info(f"可搜索PDF已生成: {searchable_pdf_path}")
+            else:
+                logger.warning(f"可搜索PDF生成失败，可能需要安装PyMuPDF: pip install pymupdf")
 
         logger.info(f"local output dir is {local_md_dir}")
 
