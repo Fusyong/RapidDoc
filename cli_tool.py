@@ -36,7 +36,7 @@ def parse_args():
         epilog="""
 示例:
   %(prog)s input.pdf -o output/
-  %(prog)s input.pdf -o output/ -batch_num 1
+  %(prog)s input.pdf -o output/ --batch-num 1
   %(prog)s input.pdf input2.pdf -o output/ --method txt
   %(prog)s input.pdf input2.pdf -o output/ --method ocr
   %(prog)s input.pdf -o output/ --start-page 0 --end-page 10
