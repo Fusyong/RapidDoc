@@ -262,7 +262,7 @@ if __name__ == '__main__':
     pdf_suffixes = [".pdf"]
     image_suffixes = [".png", ".jpeg", ".jpg"]
 
-    doc_path_list = ["mypdf/学探诊六上.pdf"]
+    doc_path_list = ["demo/mypdf/1-2.pdf"]
 
     # 遍历 pdfs 目录
     for doc_path in Path(pdf_files_dir).glob('*'):
