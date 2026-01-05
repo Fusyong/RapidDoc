@@ -222,7 +222,7 @@ class MagicModel:
             return reduct_overlap(
                 list(
                     map(
-                        lambda x: {'bbox': x['bbox'], 'score': x['score'], 'original_label': x.get('original_label')},
+                        lambda x: {'bbox': x['bbox'], 'score': x['score'], 'original_label': x.get('original_label'), 'original_order': x.get('original_order')},
                         filter(
                             lambda x: x['category_id'] == subject_category_id,
                             self.__page_model_info['layout_dets'],
@@ -235,7 +235,7 @@ class MagicModel:
             return reduct_overlap(
                 list(
                     map(
-                        lambda x: {'bbox': x['bbox'], 'score': x['score'], 'original_label': x.get('original_label')},
+                        lambda x: {'bbox': x['bbox'], 'score': x['score'], 'original_label': x.get('original_label'), 'original_order': x.get('original_order')},
                         filter(
                             lambda x: x['category_id'] == object_category_id,
                             self.__page_model_info['layout_dets'],
@@ -373,7 +373,8 @@ class MagicModel:
                 elif category_id == CategoryId.OcrText:
                     span['content'] = layout_det['text']
                     span['type'] = ContentType.TEXT
-                span['original_label'] = layout_det['original_label']
+                span['original_label'] = layout_det.get('original_label')
+                span['original_order'] = layout_det.get('original_order')
                 all_spans.append(span)
         return remove_duplicate_spans(all_spans)
 
@@ -391,6 +392,8 @@ class MagicModel:
             if category_id == category_type:
                 block = {
                     'bbox': bbox,
+                    'original_label': item.get('original_label'),
+                    'original_order': item.get('original_order'),
                     'score': item.get('score'),
                 }
                 for col in extra_col:

@@ -20,6 +20,7 @@ from rapid_doc.utils import PyPDFium2Parser
 from rapid_doc.utils.boxbase import calculate_iou
 
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
+import multiprocessing
 
 
 def pdf_page_to_image(page: pdfium.PdfPage, dpi=200, image_type=ImageType.PIL) -> dict:
@@ -74,8 +75,13 @@ def load_images_from_pdf(
         TimeoutError: 当转换超时时抛出
     """
     pdf_doc = pdfium.PdfDocument(pdf_bytes)
-    if is_windows_environment():
-        # Windows 环境下不使用多进程
+
+    concurrency_enabled = os.getenv('MINERU_PDF_CONCURRENCY_ENABLED', 'true')
+    # 检测是否为 Windows 环境
+    # 检测是否为守护进程 (Daemon) Celery 的 worker 进程通常是 daemon，无法再创建子进程
+    if (concurrency_enabled.lower() not in ['true', '1', 'yes'] or
+            is_windows_environment() or multiprocessing.current_process().daemon):
+        # 不使用多进程
         return load_images_from_pdf_core(
             pdf_bytes,
             dpi,
@@ -108,7 +114,7 @@ def load_images_from_pdf(
 
             page_ranges.append((range_start, range_end))
 
-        # logger.debug(f"PDF to images using {actual_threads} processes, page ranges: {page_ranges}")
+        logger.info(f"PDF to images using {actual_threads} processes, page ranges: {page_ranges}")
 
         with ProcessPoolExecutor(max_workers=actual_threads) as executor:
             # 提交所有任务
@@ -167,9 +173,9 @@ def load_images_from_pdf_core(
 
 
 def cut_image(span, ori_image_list, extract_original_image, extract_original_image_iou_thresh, page_num: int, page_pil_img, return_path, image_writer: FileBasedDataWriter, scale=2):
-    """从第page_num页的page中，根据bbox进行裁剪出一张jpg图片，返回图片路径 save_path：需要同时支持s3和本地,
+    """从第page_num页的page中，根据bbox进行裁剪出一张png图片，返回图片路径 save_path：需要同时支持s3和本地,
     图片存放在save_path下，文件名是:
-    {page_num}_{bbox[0]}_{bbox[1]}_{bbox[2]}_{bbox[3]}.jpg , bbox内数字取整。"""
+    {page_num}_{bbox[0]}_{bbox[1]}_{bbox[2]}_{bbox[3]}.png , bbox内数字取整。"""
     bbox = span['bbox']
     crop_img = None
     if extract_original_image and span['type'] in [ContentType.IMAGE]:
@@ -185,12 +191,12 @@ def cut_image(span, ori_image_list, extract_original_image, extract_original_ima
     img_path = f"{return_path}_{filename}" if return_path is not None else None
 
     # 新版本生成平铺路径
-    img_hash256_path = f"{str_sha256(img_path)}.jpg"
-    # img_hash256_path = f'{img_path}.jpg'
+    img_hash256_path = f"{str_sha256(img_path)}.png"
+    # img_hash256_path = f'{img_path}.png'
     if not crop_img:
         crop_img = get_crop_img(bbox, page_pil_img, scale=scale)
 
-    img_bytes = image_to_bytes(crop_img, image_format="JPEG")
+    img_bytes = image_to_bytes(crop_img, image_format="PNG")
 
     image_writer.write(img_hash256_path, img_bytes)
     return img_hash256_path
@@ -237,12 +243,18 @@ def images_bytes_to_pdf_bytes(image_bytes):
     # 获取 PDF bytes 并重置指针（可选）
     pdf_bytes = pdf_buffer.getvalue()
     pdf_buffer.close()
+    layout_original_image = os.getenv('MINERU_LAYOUT_ORIGINAL_IMAGE', 'true')
+    if (layout_original_image.lower() in ['true', '1', 'yes']):
+        return {
+            "pdf_bytes": pdf_bytes,
+            "original_image": image,
+        }
     return pdf_bytes
 
 def get_ori_image(
         page: pdfium.PdfPage,
         max_depth: int = 15,
-        render: bool = False,
+        render: bool = True,
         scale_to_original: bool = True,
 ) -> list:
     """
@@ -310,7 +322,10 @@ def save_table_fill_image(layout_dets: list[dict], table_fill_image_list: list[d
         return
     """保存表格里的图片，图片路径 save_path：需要同时支持s3和本地,
     图片存放在save_path下，文件名是:
-    {page_num}_{bbox[0]}_{bbox[1]}_{bbox[2]}_{bbox[3]}.jpg , bbox内数字取整。"""
+    {page_num}_{bbox[0]}_{bbox[1]}_{bbox[2]}_{bbox[3]}.png , bbox内数字取整。"""
+
+    if not image_writer:
+        return
 
     def return_path(path_type):
         return f"{path_type}/{page_img_md5}"
@@ -331,9 +346,9 @@ def save_table_fill_image(layout_dets: list[dict], table_fill_image_list: list[d
                 img_path = f"{return_path}_{filename}" if return_path is not None else None
 
                 # 新版本生成平铺路径
-                img_hash256_path = f"{str_sha256(img_path)}.jpg"
-                # img_hash256_path = f'{img_path}.jpg'
-                img_bytes = image_to_bytes(pil_image, image_format="JPEG")
+                img_hash256_path = f"{str_sha256(img_path)}.png"
+                # img_hash256_path = f'{img_path}.png'
+                img_bytes = image_to_bytes(pil_image, image_format="PNG")
                 image_writer.write(img_hash256_path, img_bytes)
 
                 image_dir = str(os.path.basename(image_writer._parent_dir))

@@ -1,3 +1,5 @@
+from typing import List, Dict, Any
+
 from rapid_doc.model.ocr.ocr_patch import apply_ocr_patch
 
 # 应用所有 OCR 相关补丁
@@ -19,10 +21,12 @@ from rapid_doc.utils.config_reader import get_device
 from rapid_doc.utils.model_utils import check_openvino
 from rapid_doc.utils.ocr_utils import check_img, preprocess_image, sorted_boxes, merge_det_boxes, update_det_boxes, get_rotate_crop_image
 from rapidocr.inference_engine.base import InferSession
-models_dir = os.getenv('MINERU_MODELS_DIR', None)
+models_dir = os.getenv('RAPID_MODELS_DIR', None)
 if models_dir:
     # 从指定的文件夹内寻找模型文件
     InferSession.DEFAULT_MODEL_PATH = Path(models_dir)
+    from rapidocr.ch_ppocr_rec import main as rec_main
+    rec_main.DEFAULT_MODEL_PATH = Path(models_dir)
 
 class RapidOcrModel(object):
     def __init__(self, det_db_box_thresh=0.3, lang=None, ocr_config=None, use_dilation=True, det_db_unclip_ratio=1.8, enable_merge_det_boxes=True):
@@ -96,6 +100,9 @@ class RapidOcrModel(object):
             mfd_res=None,
             tqdm_enable=False,
             tqdm_desc="OCR-rec Predict",
+            return_word_box=False,
+            ori_img=None,
+            dt_boxes=None,
             ):
         assert isinstance(img, (np.ndarray, list, str, bytes))
         if isinstance(img, list) and det == True:
@@ -144,12 +151,68 @@ class RapidOcrModel(object):
                     if not isinstance(img, list):
                         img = preprocess_image(img)
                         img = [img]
-                    rec_input = TextRecInput(img=img, return_word_box=False)
+                    rec_input = TextRecInput(img=img, return_word_box=return_word_box)
                     rec_result = self.text_recognizer_call(rec_input, tqdm_enable=tqdm_enable, tqdm_desc=tqdm_desc)
-                    rec_res = list(zip(rec_result.txts, rec_result.scores))
+                    if return_word_box and ori_img is not None and dt_boxes:
+                        op_record = {'padding_1': {'left': 0, 'top': 0}, 'preprocess': {'ratio_h': 1.0, 'ratio_w': 1.0}}
+                        raw_h, raw_w = ori_img.shape[:2]
+                        dt_boxes_np = [np.array(box, dtype=np.float32) for box in dt_boxes]
+                        word_results = self.calc_word_boxes(img, dt_boxes_np, rec_result, op_record, raw_h, raw_w)
+                        rec_res = list(zip(rec_result.txts, rec_result.scores, word_results))
+                    else:
+                        rec_res = list(zip(rec_result.txts, rec_result.scores))
                     ocr_res.append(rec_res)
                 return ocr_res
 
+    def calc_word_boxes(
+        self,
+        img: List[np.ndarray],
+        dt_boxes: np.ndarray,
+        rec_res: TextRecOutput,
+        op_record: Dict[str, Any],
+        raw_h: int,
+        raw_w: int,
+    ) -> Any:
+        rec_res = self.ocr_engine.cal_rec_boxes(
+            img, dt_boxes, rec_res, self.ocr_engine.return_single_char_box
+        )
+
+        origin_words = []
+        for word_line in rec_res.word_results:
+            origin_words_item = []
+            for txt, score, bbox in word_line:
+                if bbox is None:
+                    continue
+
+                origin_words_points = self.map_boxes_to_original(
+                    np.array([bbox]).astype(np.float64), op_record, raw_h, raw_w
+                )
+                origin_words_points = origin_words_points.astype(np.int32).tolist()[0]
+                origin_words_item.append((txt, score, origin_words_points))
+
+            if origin_words_item:
+                origin_words.append(tuple(origin_words_item))
+        return tuple(origin_words)
+
+    def map_boxes_to_original(
+            self, dt_boxes: np.ndarray, op_record: Dict[str, Any], ori_h: int, ori_w: int
+    ) -> np.ndarray:
+        for op in reversed(list(op_record.keys())):
+            v = op_record[op]
+            if "padding" in op:
+                top, left = v.get("top"), v.get("left")
+                dt_boxes[:, :, 0] -= left
+                dt_boxes[:, :, 1] -= top
+            elif "preprocess" in op:
+                ratio_h = v.get("ratio_h")
+                ratio_w = v.get("ratio_w")
+                dt_boxes[:, :, 0] *= ratio_w
+                dt_boxes[:, :, 1] *= ratio_h
+
+        dt_boxes = np.where(dt_boxes < 0, 0, dt_boxes)
+        dt_boxes[..., 0] = np.where(dt_boxes[..., 0] > ori_w, ori_w, dt_boxes[..., 0])
+        dt_boxes[..., 1] = np.where(dt_boxes[..., 1] > ori_h, ori_h, dt_boxes[..., 1])
+        return dt_boxes
 
     def __call__(self, img, mfd_res=None):
 

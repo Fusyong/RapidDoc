@@ -19,6 +19,7 @@ from loguru import logger
 
 from file_converter import ensure_pdf, OFFICE_EXTENSIONS
 from rapid_doc.cli.common import aio_do_parse
+from rapid_doc.utils.pdf_image_tools import images_bytes_to_pdf_bytes
 from rapid_doc.version import __version__
 
 app = FastAPI(
@@ -195,6 +196,8 @@ async def file_parse(
                 )
             if file_suffix in pdf_suffixes + image_suffixes:
                 content = await file.read()
+                if file_suffix in image_suffixes:
+                    content = images_bytes_to_pdf_bytes(content)
             else:
                 # 创建临时目录用于文档转换
                 temp_dir = tempfile.mkdtemp(prefix="fastapi_adapter_")
@@ -284,7 +287,10 @@ async def file_parse(
                     # 写入图片
                     if return_images:
                         images_dir = os.path.join(parse_dir, "images")
-                        image_paths = glob.glob(os.path.join(glob.escape(images_dir), "*.jpg"))
+                        image_paths = (
+                                glob.glob(os.path.join(glob.escape(images_dir), "*.jpg")) +
+                                glob.glob(os.path.join(glob.escape(images_dir), "*.png"))
+                        )
                         for image_path in image_paths:
                             zf.write(image_path,
                                      arcname=os.path.join(safe_pdf_name, "images", os.path.basename(image_path)))
@@ -320,8 +326,10 @@ async def file_parse(
                         data["content_list"] = json.loads(get_infer_result("_content_list.json", pdf_name, parse_dir))
                     if return_images:
                         images_dir = os.path.join(parse_dir, "images")
-                        safe_pattern = os.path.join(glob.escape(images_dir), "*.jpg")
-                        image_paths = glob.glob(safe_pattern)
+                        image_paths = (
+                                glob.glob(os.path.join(glob.escape(images_dir), "*.jpg")) +
+                                glob.glob(os.path.join(glob.escape(images_dir), "*.png"))
+                        )
                         data["images"] = {
                             os.path.basename(
                                 image_path

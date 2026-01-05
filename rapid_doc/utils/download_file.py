@@ -18,7 +18,7 @@ class DownloadFileInput:
 
 CPU_MODEL = [
     # layout
-    "pp_doclayout_plus_l.onnx",
+    "pp_doclayoutv2.onnx",
     # formula
     "pp_formulanet_plus_m.onnx",
     # ocr
@@ -29,13 +29,14 @@ CPU_MODEL = [
     "FZYTK.TTF",
     # table
     "paddle_cls.onnx",
+    "q_cls.onnx",
     "unet.onnx",
     "slanet-plus.onnx",
 ]
 
 GPU_MODEL = [
     # layout
-    "pp_doclayout_plus_l.onnx",
+    "pp_doclayoutv2.onnx",
     # formula
     "pp_formulanet_plus_m.pth",
     "pp_formulanet_plus_m_inference.yml"
@@ -47,6 +48,27 @@ GPU_MODEL = [
     "FZYTK.TTF",
     # table
     "paddle_cls.onnx",
+    "q_cls.onnx",
+    "unet.onnx",
+    "slanet-plus.onnx",
+]
+
+NPU_MODEL = [
+    # layout
+    "pp_doclayoutv2.onnx",
+    "doclayout_yolo_docstructbench_imgsz1024.onnx",
+    # formula
+    "pp_formulanet_plus_m.pth",
+    "pp_formulanet_plus_m_inference.yml"
+    # ocr
+    "ch_PP-OCRv5_det_mobile_infer.pth",
+    "ch_PP-OCRv5_rec_mobile_infer.pth",
+    "ch_ptocr_mobile_v2.0_cls_infer.pth",
+    "ppocrv5_dict.txt",
+    "FZYTK.TTF",
+    # table
+    "paddle_cls.onnx",
+    "q_cls.onnx",
     "unet.onnx",
     "slanet-plus.onnx",
 ]
@@ -59,8 +81,10 @@ class DownloadFile:
 
     @classmethod
     def run(cls, input_params: DownloadFileInput):
-        if device_mode.startswith('cuda') or device_mode.startswith('npu'):
+        if device_mode.startswith('cuda'):
             default_model = GPU_MODEL
+        elif device_mode == 'npu':
+            default_model = NPU_MODEL
         elif device_mode == 'all':
             default_model = set(GPU_MODEL + CPU_MODEL)
         else:

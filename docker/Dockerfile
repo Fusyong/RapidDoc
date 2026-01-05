@@ -21,8 +21,8 @@ RUN apt-get update && \
 WORKDIR /app
 
 # 安装 Python 依赖
-RUN python3 -m pip install 'rapid-doc[cpu]==0.3.0' -i https://pypi.org/simple --break-system-packages && \
-    python3 -m pip install 'rapid-doc[api]==0.3.0' -i https://pypi.org/simple --break-system-packages && \
+RUN python3 -m pip install 'rapid-doc[cpu]==0.6.1' -i https://pypi.org/simple --break-system-packages && \
+    python3 -m pip install 'rapid-doc[api]==0.6.1' -i https://pypi.org/simple --break-system-packages && \
     python3 -m pip cache purge
 
 # 复制配置文件和脚本（优先复制，利用Docker缓存）
@@ -33,7 +33,7 @@ COPY start_with_env.sh /app/
 RUN chmod +x  start_with_env.sh
 
 # 复制应用代码（最后复制，避免频繁变更影响缓存）
-COPY app.py file_converter.py download_models.py download_file.py /app/
+COPY app.py file_converter.py download_models.py models_download_utils.py /app/
 
 # 设置基础环境变量
 ENV PYTHONPATH=/app
@@ -43,7 +43,7 @@ ENV API_PORT=8888
 ENV STARTUP_WAIT_TIME=15
 ENV LOG_LEVEL=INFO
 ENV MINERU_DEVICE_MODE=cpu
-ENV MINERU_MODELS_DIR=/app/models
+ENV RAPID_MODELS_DIR=/app/models
 # 下载默认模型文件实现离线部署
 RUN python3 download_models.py
 

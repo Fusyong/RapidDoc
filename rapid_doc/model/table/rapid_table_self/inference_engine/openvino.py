@@ -2,18 +2,14 @@ import os
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List
-
 import numpy as np
-
-from openvino.runtime import Core
-
 try:
     import openvino as ov
+    from openvino.runtime import Core
 except ImportError:
     raise ImportError(
         "openvino is not installed. Please install it with: pip install openvino"
     )
-
 
 from ..model_processor.main import ModelProcessor
 from ..utils.logger import Logger
@@ -88,7 +84,11 @@ class OpenVINOInferSession(InferSession):
         try:
             input_tensor_name = self.input_tensor.get_any_name()
             self.infer_request.set_tensor(input_tensor_name, ov.Tensor(input_content))
-            self.infer_request.infer()
+
+            # self.infer_request.infer()
+            # 使用异步推理替代同步 infer()
+            self.infer_request.start_async()
+            self.infer_request.wait()  # 等待推理完成
 
             outputs = []
             for output_tensor in self.output_tensors:

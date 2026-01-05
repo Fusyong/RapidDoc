@@ -1,20 +1,13 @@
-import os
 import cv2
-from pathlib import Path
 
 from rapid_doc.model.layout.rapid_layout_self import ModelType, RapidLayout, RapidLayoutInput
-from rapid_doc.model.layout.rapid_layout_self.utils.typings import PP_DOCLAYOUT_PLUS_L_Threshold, PP_DOCLAYOUT_L_Threshold
 from rapid_doc.utils.config_reader import get_device
 from rapid_doc.utils.enum_class import CategoryId
-from rapid_doc.model.layout.rapid_layout_self.model_handler import ModelProcessor
-models_dir = os.getenv('MINERU_MODELS_DIR', None)
-if models_dir:
-    # 从指定的文件夹内寻找模型文件
-    ModelProcessor.DEFAULT_MODEL_DIR = Path(models_dir)
+from rapid_doc.utils.boxbase import calculate_iou
 
 class RapidLayoutModel(object):
     def __init__(self, layout_config=None):
-        cfg = RapidLayoutInput(model_type=ModelType.PP_DOCLAYOUT_PLUS_L, conf_thresh=0.4)
+        cfg = RapidLayoutInput(model_type=ModelType.PP_DOCLAYOUTV2)
 
         device = get_device()
         if device.startswith('cuda'):
@@ -25,84 +18,40 @@ class RapidLayoutModel(object):
             device_id = int(device.split(':')[1]) if ':' in device else 0  # npu 编号
             engine_cfg = {'use_cann': True, "cann_ep_cfg.device_id": device_id}
             cfg.engine_cfg = engine_cfg
+            cfg.model_type = ModelType.DOCLAYOUT_DOCSTRUCTBENCH
+            cfg.conf_thresh = 0.2
         # 如果传入了 layout_config，则用传入配置覆盖默认配置
         if layout_config is not None:
+            if layout_config.get("model_type"):
+                cfg.model_type = layout_config.get("model_type")
             if not layout_config.get("conf_thresh"):
-                if cfg.model_type == ModelType.PP_DOCLAYOUT_PLUS_L:
-                    # PP-DocLayout_plus-L 默认阈值
-                    cfg.conf_thresh = PP_DOCLAYOUT_PLUS_L_Threshold
-                elif cfg.model_type == ModelType.PP_DOCLAYOUT_L:
+                if cfg.model_type == ModelType.PP_DOCLAYOUT_S:
                     # S可能存在部分漏检，自动调低阈值
-                    cfg.conf_thresh = PP_DOCLAYOUT_L_Threshold
-                elif cfg.model_type == ModelType.PP_DOCLAYOUT_S:
-                    # S可能存在部分漏检，自动调低阈值
+                    cfg.conf_thresh = 0.2
+                elif cfg.model_type == ModelType.DOCLAYOUT_DOCSTRUCTBENCH:
+                    # 可能存在部分漏检，自动调低阈值
                     cfg.conf_thresh = 0.2
             # 遍历字典，把传入配置设置到 default_cfg 对象中
             for key, value in layout_config.items():
                 if hasattr(cfg, key):
                     setattr(cfg, key, value)
                     setattr(cfg, key, value)
+        layout_config = layout_config or {}
+        self.markdown_ignore_labels = layout_config.get("markdown_ignore_labels",
+                                                        ["number", "footnote", "header", "header_image", "footer", "footer_image", "aside_text",])
+        self.pp_doclayout_cls_dict, self.pp_doclayout_plus_cls_dict, self.pp_doclayoutv2_cls_dict \
+            = get_cls_dicts(self.markdown_ignore_labels)
 
         self.model = RapidLayout(cfg=cfg)
         self.model_type = cfg.model_type
-        self.doclayout_yolo_list = ['title', 'plain text', 'abandon', 'figure', 'figure_caption', 'table', 'table_caption', 'table_footnote', 'isolate_formula', 'formula_caption',
-                          '10', '11', '12', 'inline_formula', 'isolated_formula', 'ocr_text']
-
-        # PP-DocLayout-L、PP-DocLayout-M、PP-DocLayout-S 23个常见的类别
-        self.category_dict = {
-            "paragraph_title": CategoryId.Title,
-            "image": CategoryId.ImageBody,
-            "text": CategoryId.Text,
-            "number": CategoryId.Abandon,
-            "abstract": CategoryId.Text,
-            "content": CategoryId.Text,
-            "figure_title": CategoryId.Text,
-            "formula": CategoryId.InterlineEquation_YOLO,
-            "table": CategoryId.TableBody,
-            "table_title": CategoryId.TableCaption,
-            "reference": CategoryId.Text,
-            "doc_title": CategoryId.Title,
-            "footnote": CategoryId.Abandon,
-            "header": CategoryId.Abandon,
-            "algorithm": CategoryId.Text,
-            "footer": CategoryId.Abandon,
-            "seal": CategoryId.Abandon,
-            "chart_title": CategoryId.ImageCaption,
-            "chart": CategoryId.ImageBody,
-            "formula_number": CategoryId.InterlineEquationNumber_Layout,
-            "header_image": CategoryId.Abandon,
-            "footer_image": CategoryId.Abandon,
-            "aside_text": CategoryId.Abandon,
-        }
-
-        # PP-DocLayout_plus-L 20个常见的类别
-        self.category_plus_mapping = {
-            "paragraph_title": CategoryId.Title,
-            "image": CategoryId.ImageBody,
-            "text": CategoryId.Text,
-            "number": CategoryId.Abandon,
-            "abstract": CategoryId.Text,
-            "content": CategoryId.Text,
-            "figure_title": CategoryId.Text,
-            "formula": CategoryId.InterlineEquation_YOLO,
-            "table": CategoryId.TableBody,
-            "reference": CategoryId.Text,
-            "doc_title": CategoryId.Title,
-            "footnote": CategoryId.Abandon,
-            "header": CategoryId.Abandon,
-            "algorithm": CategoryId.Text,
-            "footer": CategoryId.Abandon,
-            "seal": CategoryId.Abandon,
-            "chart": CategoryId.ImageBody,
-            "formula_number": CategoryId.InterlineEquationNumber_Layout,
-            "aside_text": CategoryId.Abandon,
-            "reference_content": CategoryId.Text,
-        }
+        self.doclayout_yolo_list = ['title', 'plain text', 'abandon', 'figure', 'figure_caption',
+                                    'table', 'table_caption', 'table_footnote', 'isolate_formula', 'formula_caption',
+                                    '10', '11', '12', 'inline_formula', 'isolated_formula', 'ocr_text']
 
     def predict(self, image):
         return self.batch_predict(images=[image], batch_size=1)[0]
 
-    def batch_predict(self, images: list, batch_size: int) -> list:
+    def batch_predict(self, images: list, batch_size: int, dpi=200) -> list:
         images_layout_res = []
         processed_images = []
         scales = []
@@ -112,28 +61,40 @@ class RapidLayoutModel(object):
             h, w = img.shape[:2]
             # 以A4纸200DPI为基准，判断是否太大
             if max(h, w) > 2200:
-                scale = 144 / 200
+                scale = 144 / dpi
                 resized = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             else:
                 scale = 1.0
                 resized = img
+            # import uuid
+            # cv2.imwrite(rf"C:\ocr\img\test\output-images\{uuid.uuid4().hex}.png", resized)
             processed_images.append(resized)
             scales.append(scale)
 
         all_results = self.model(img_contents=processed_images, batch_size=batch_size, tqdm_enable=True)
         for img_idx, results in enumerate(all_results):
+            # import uuid
+            # results.vis(f"output-PP_DOCLAYOUT/{uuid.uuid4().hex}__{img_idx}.png")
             layout_res = []
             img, boxes, scores, class_names, elapse = results.img, results.boxes, results.scores, results.class_names, results.elapse
+            orders = results.orders if results.orders is not None else [-1] * len(boxes)
             scale = scales[img_idx]
             restore_scale = 1.0 / scale
             temp_results = []
-            for xyxy, conf, cla in zip(boxes, scores, class_names):
+            for xyxy, conf, cla, order in zip(boxes, scores, class_names, orders):
                 xmin, ymin, xmax, ymax = [round(float(p), 2) for p in xyxy]
                 # xmin, ymin, xmax, ymax = [p for p in xyxy]
                 if self.model_type == ModelType.PP_DOCLAYOUT_PLUS_L:
-                    category_id = self.category_plus_mapping[cla]
+                    category_id = self.pp_doclayout_plus_cls_dict[cla]
+                elif self.model_type == ModelType.PP_DOCLAYOUTV2:
+                    category_id = self.pp_doclayoutv2_cls_dict[cla]
+                elif self.model_type == ModelType.DOCLAYOUT_DOCSTRUCTBENCH:
+                    if cla == 'isolate_formula':
+                        category_id = 14
+                    else:
+                        category_id = self.doclayout_yolo_list.index(cla)
                 else:
-                    category_id = self.category_dict[cla]
+                    category_id = self.pp_doclayout_cls_dict[cla]
                 # 如果是表格/图片，边界适当扩展（DocLayout模型识别的边框坐标，稍微有一点不全）
                 # if category_id in [CategoryId.TableBody, CategoryId.ImageBody]:
                 #     xmax = min(img.shape[1], xmax + 3)
@@ -141,12 +102,14 @@ class RapidLayoutModel(object):
                 temp_results.append({
                     "category_id": category_id,
                     "original_label": cla,
+                    "original_order": order,
                     "bbox": (xmin, ymin, xmax, ymax),
                     "score": round(float(conf), 3)
                 })
 
-            # 行内公式判断
-            temp_results = self.check_inline_formula(temp_results)
+            if self.model_type != ModelType.PP_DOCLAYOUTV2:
+                # 行内公式判断
+                temp_results = self.check_inline_formula(temp_results)
 
             for item in temp_results:
                 xmin, ymin, xmax, ymax = item["bbox"]
@@ -157,6 +120,7 @@ class RapidLayoutModel(object):
                 layout_res.append({
                     "category_id": item["category_id"],
                     "original_label": item["original_label"],
+                    "original_order": item["original_order"],
                     "poly": [xmin, ymin, xmax, ymin, xmax, ymax, xmin, ymax],
                     "score": item["score"],
                 })
@@ -179,30 +143,108 @@ class RapidLayoutModel(object):
 
 def is_contained(box1, box2, thresh=0.9):
     """
-    判断 box1 是否被 box2 包含（重叠面积 / box1面积 >= 阈值）
+    如果是行内公式，必然会和周围的OCR文本框 IoU大于一定阈值
     """
-    x1, y1, x2, y2 = box1
-    x1_p, y1_p, x2_p, y2_p = box2
-
-    # 计算 box1 面积
-    box1_area = max(0, x2 - x1) * max(0, y2 - y1)
-
-    # 计算交集区域
-    xi1 = max(x1, x1_p)
-    yi1 = max(y1, y1_p)
-    xi2 = min(x2, x2_p)
-    yi2 = min(y2, y2_p)
-
-    inter_width = max(0, xi2 - xi1)
-    inter_height = max(0, yi2 - yi1)
-    intersect_area = inter_width * inter_height
-
-    # 计算覆盖率：交集面积 / box1面积
-    ratio = intersect_area / box1_area if box1_area > 0 else 0
-
-    return ratio >= thresh
+    return calculate_iou(box1, box2) >= thresh
 
 
+def get_cls_dicts(markdown_ignore_labels):
+    """
+    如果是行内公式，必然会和周围的OCR文本框 IoU大于一定阈值
+    """
+    # PP-DocLayout-L、PP-DocLayout-M、PP-DocLayout-S 23个常见的类别
+    pp_doclayout_cls_dict = {
+        "paragraph_title": CategoryId.Title,
+        "image": CategoryId.ImageBody,
+        "text": CategoryId.Text,
+        "number": CategoryId.Text,  # Abandon
+        "abstract": CategoryId.Text,
+        "content": CategoryId.Text,
+        "figure_title": CategoryId.Text,
+        "formula": CategoryId.InterlineEquation_YOLO,
+        "table": CategoryId.TableBody,
+        "table_title": CategoryId.TableCaption,
+        "reference": CategoryId.Text,
+        "doc_title": CategoryId.Title,
+        "footnote": CategoryId.Text,  # Abandon
+        "header": CategoryId.Text,  # Abandon
+        "algorithm": CategoryId.Text,
+        "footer": CategoryId.Text,  # Abandon
+        "seal": CategoryId.ImageBody,
+        "chart_title": CategoryId.ImageCaption,
+        "chart": CategoryId.ImageBody,
+        "formula_number": CategoryId.InterlineEquationNumber_Layout,
+        "header_image": CategoryId.ImageBody,  # Abandon
+        "footer_image": CategoryId.ImageBody,  # Abandon
+        "aside_text": CategoryId.Text,  # Abandon
+    }
+    pp_doclayout_cls_dict = {
+        k: (CategoryId.Abandon if k in markdown_ignore_labels else v)
+        for k, v in pp_doclayout_cls_dict.items()
+    }
+
+    # PP-DocLayout_plus-L 20个常见的类别
+    pp_doclayout_plus_cls_dict = {
+        "paragraph_title": CategoryId.Title,
+        "image": CategoryId.ImageBody,
+        "text": CategoryId.Text,
+        "number": CategoryId.Text,  # Abandon
+        "abstract": CategoryId.Text,
+        "content": CategoryId.Text,
+        "figure_title": CategoryId.Text,
+        "formula": CategoryId.InterlineEquation_YOLO,
+        "table": CategoryId.TableBody,
+        "reference": CategoryId.Text,
+        "doc_title": CategoryId.Title,
+        "footnote": CategoryId.Text,  # Abandon
+        "header": CategoryId.Text,  # Abandon
+        "algorithm": CategoryId.Text,
+        "footer": CategoryId.Text,  # Abandon
+        "seal": CategoryId.ImageBody,
+        "chart": CategoryId.ImageBody,
+        "formula_number": CategoryId.InterlineEquationNumber_Layout,
+        "aside_text": CategoryId.Text,  # Abandon
+        "reference_content": CategoryId.Text,
+    }
+    pp_doclayout_plus_cls_dict = {
+        k: (CategoryId.Abandon if k in markdown_ignore_labels else v)
+        for k, v in pp_doclayout_plus_cls_dict.items()
+    }
+
+    # PP-DocLayoutV2 25个常见的类别
+    pp_doclayoutv2_cls_dict = {
+        "abstract": CategoryId.Text,
+        "algorithm": CategoryId.Text,
+        "aside_text": CategoryId.Text,  # Abandon
+        "chart": CategoryId.ImageBody,
+        "content": CategoryId.Text,
+        "display_formula": CategoryId.InterlineEquation_YOLO,  # 行间公式
+        "doc_title": CategoryId.Title,
+        "figure_title": CategoryId.Text,
+        "footer": CategoryId.Text,  # Abandon
+        "footer_image": CategoryId.ImageBody,  # Abandon
+        "footnote": CategoryId.Text,  # Abandon
+        "formula_number": CategoryId.InterlineEquationNumber_Layout,
+        "header": CategoryId.Text,
+        "header_image": CategoryId.ImageBody,  # Abandon
+        "image": CategoryId.ImageBody,
+        "inline_formula": CategoryId.InlineEquation,  # 行内公式
+        "number": CategoryId.Text,  # Abandon
+        "paragraph_title": CategoryId.Title,
+        "reference": CategoryId.Text,
+        "reference_content": CategoryId.Text,
+        "seal": CategoryId.ImageBody,
+        "table": CategoryId.TableBody,
+        "text": CategoryId.Text,
+        "vertical_text": CategoryId.Text,
+        "vision_footnote": CategoryId.Text,  # Abandon
+    }
+    pp_doclayoutv2_cls_dict = {
+        k: (CategoryId.Abandon if k in markdown_ignore_labels else v)
+        for k, v in pp_doclayoutv2_cls_dict.items()
+    }
+
+    return pp_doclayout_cls_dict, pp_doclayout_plus_cls_dict, pp_doclayoutv2_cls_dict
 
 if __name__ == '__main__':
 
@@ -215,10 +257,12 @@ if __name__ == '__main__':
 
     # r"C:\ocr\models\ppmodel\layout\PP-DocLayout-M\openvino\pp_doclayout_m.xml"
 
-    cfg = RapidLayoutInput(model_type=ModelType.PP_DOCLAYOUT_PLUS_L, conf_thresh=0.4)
+    cfg = RapidLayoutInput(model_type=ModelType.PP_DOCLAYOUTV2)
+    # engine_cfg = {'use_cuda': True, "cuda_ep_cfg.device_id": 0, "cuda_ep_cfg.gpu_mem_limit": 2 * 1024 * 1024 * 1024,}
+    # cfg.engine_cfg = engine_cfg
     model = RapidLayout(cfg=cfg)
 
+    all_results = model(img_contents=[r"cf7af1ef0c174bbaab6bef1ef27bbd2a.png"])
 
-    all_results = model(img_contents=[r"reader_order_07.png",])
     print(all_results)
     all_results[0].vis(r"layout_vis.png")

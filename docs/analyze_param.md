@@ -25,7 +25,7 @@ def doc_analyze(
 os.environ['MINERU_DEVICE_MODE'] = "cpu"
 
 # 模型文件存储目录。如果不设置会默认下载到rapid_doc项目里面
-os.environ['MINERU_MODELS_DIR'] = r'D:\CodeProjects\doc\RapidAI\models'
+os.environ['RAPID_MODELS_DIR'] = r'D:\CodeProjects\doc\RapidAI\models'
 ```
 #### 1、使用gpu推理
 ```bash
@@ -46,12 +46,13 @@ os.environ['MINERU_DEVICE_MODE'] = "cuda:1"
 
 #### 2、layout_config 版面解析参数说明如下：
 
-|  参数名   |  说明   |         默认值         | 备注 |
-| :-------: |:-----:|:-------------------:|:--:|
-| model_type |  模型   | PP_DOCLAYOUT_PLUS_L |  |
-| conf_thresh  |  阈值   |     0.5（_S为0.2）     |  |
-| batch_num | 批处理大小 |          1          |  |
-| model_dir_or_path | 模型路径  |        None         |  |
+|  参数名   |   说明    |         默认值         | 备注 |
+| :-------: |:-------:|:-------------------:|:--:|
+| model_type |   模型    | PP_DOCLAYOUTV2 |  |
+| conf_thresh  |   阈值    |     0.5（_S为0.2）     |  |
+| batch_num |  批处理大小  |          1          |  |
+| model_dir_or_path |  模型路径   |        None         |  |
+| markdown_ignore_labels | 忽略的版面类型 |        ["number","footnote","header","header_image","footer","footer_image","aside_text",]        |  |
 示例：
 
 ```python
@@ -99,13 +100,14 @@ ocr_config = {
 
 #### 4、formula_config 公式识别参数说明如下：
 
-|  参数名   |  说明   |         默认值          |                备注                 |
-| :-------: |:-----:|:--------------------:|:---------------------------------:|
-| model_type |  模型   | PP_FORMULANET_PLUS_M |                                   |
-| engine_type  | 推理引擎 | ONNXRUNTIME（cpu）、TORCH（gpu） |  torch仅支持PP_FORMULANET_PLUS_M模型   |
-| formula_level  |  公式识别等级   |          0           | 公式识别等级，默认为0，全识别。1:仅识别行间公式，行内公式不识别 |
-| batch_num | 批处理大小 |          1           |                                   |
-| model_dir_or_path | 模型路径  |         None         |                                   |
+|  参数名   |    说明    |         默认值          |                备注                 |
+| :-------: |:--------:|:--------------------:|:---------------------------------:|
+| model_type |    模型    | PP_FORMULANET_PLUS_M |                                   |
+| engine_type  |   推理引擎   | ONNXRUNTIME（cpu）、TORCH（gpu） |  torch仅支持PP_FORMULANET_PLUS_M模型   |
+| formula_level  |  公式识别等级  |          0           | 公式识别等级，默认为0，全识别。1:仅识别行间公式，行内公式不识别 |
+| batch_num |  批处理大小   |          1           |                                   |
+| model_dir_or_path |   模型路径   |         None         |                 不设置自动下载                  |
+| dict_keys_path | yml字典路径  |         None         |         torch推理使用，不设置自动下载         |
 示例：
 
 ```python
@@ -121,45 +123,56 @@ formula_config = {
 
 #### 5、table_config 表格识别参数说明如下：
 
-|               参数名                |                说明                |         默认值          |                   备注                   |
-|:--------------------------------:|:--------------------------------:|:--------------------:|:--------------------------------------:|
-|            force_ocr             |          表格文字是否强制使用ocr           | False | 根据 parse_method 来判断是否需要ocr还是从pdf中直接提取文本 |
-|        skip_text_in_image        |   是否跳过表格里图片中的文字                  | True |       如表格单元格中嵌入的图片、图标、扫描底图等，里面的文字      |
-|          use_img2table           |       是否优先使用img2table库提取表格       | False |      需要手动安装（pip install img2table），基于opencv识别准确度不如使用模型，但是速度很快，默认关闭       |
-|            model_type            |                模型                | UNET_SLANET_PLUS |      有线表格使用unet，无线表格使用slanet_plus      |
-|          engine_type             | 推理引擎 | OPENVINO（cpu）、ONNXRUNTIME（gpu）|          None           |  torch仅支持UNITABLE模型   |
-|        model_dir_or_path         |               模型地址               |          None           |      单个模型使用。如SLANET_PLUS、UNITABLE      |
-|      cls.model_dir_or_path       |             表格分类模型地址             |         None           |                                        |
-|      unet.model_dir_or_path      |            UNET表格模型地址            |         None         |                                        |
-|    unitable.model_dir_or_path    |          UNITABLE表格模型地址          |         None         |                                        |
-|  slanet_plus.model_dir_or_path   |        SLANET_PLUS表格模型地址         |         None         |                                        |
-|   wired_cell.model_dir_or_path   |            有线单元格模型地址             |         None         |              配置SLANEXT时使用              |
-| wireless_cell.model_dir_or_path  |            无线单元格模型地址             |         None         |              配置SLANEXT时使用              |
-|  wired_table.model_dir_or_path   |            有线表结构模型地址             |         None         |              配置SLANEXT时使用              |
-| wireless_table.model_dir_or_path |            无线表结构模型地址             |         None         |              配置SLANEXT时使用              |
+|               参数名                |          说明           |              默认值               |                              备注                               |
+|:--------------------------------:|:---------------------:|:------------------------------:|:-------------------------------------------------------------:|
+|            force_ocr             |     表格文字是否强制使用ocr     |             False              |            根据 parse_method 来判断是否需要ocr还是从pdf中直接提取文本            |
+|        skip_text_in_image        |     是否跳过表格里图片中的文字     |              True              |                  如表格单元格中嵌入的图片、图标、扫描底图等，里面的文字                  |
+|          use_img2table           | 是否优先使用img2table库提取表格  |             False              | 需要手动安装（pip install img2table），基于opencv识别准确度不如使用模型，但是速度很快，默认关闭 |
+|            model_type            |          模型           |        UNET_SLANET_PLUS        |                 有线表格使用unet，无线表格使用slanet_plus                  |
+|           engine_type            |         推理引擎          | OPENVINO（cpu）、ONNXRUNTIME（gpu） |                             None                              |  torch仅支持UNITABLE模型   |
+|           use_word_box           |      使用单字坐标匹配单元格      |              True              |                                                               |
+|        use_compare_table         | 启用表格结果比较（同时跑有线/无线并比对） |             False              |       如果开启，分类判断为有线表格时，也会用无线表格模型识别，然后比较两个模型选择有效单元格识别结果多的       |
+|       table_formula_enable       |        表格内公式识别        |              True              |                                                               |
+|        table_image_enable        |        表格内图片识别        |              True              |                                                               |
+|      extract_original_image      |      是否提取表格内原始图片      |       False                    |                                                               |
+|        model_dir_or_path         |         模型地址          |              None              |                 单个模型使用。如SLANET_PLUS、UNITABLE                  |
+|          cls.model_type          |        表格分类模型         |             Q_CLS              |                                                               |
+|      cls.model_dir_or_path       |       表格分类模型地址        |              None              |                                                               |
+|      unet.model_dir_or_path      |      UNET表格模型地址       |              None              |                                                               |
+|    unitable.model_dir_or_path    |    UNITABLE表格模型地址     |              None              |                                                               |
+|  slanet_plus.model_dir_or_path   |   SLANET_PLUS表格模型地址   |              None              |                                                               |
+|   wired_cell.model_dir_or_path   |       有线单元格模型地址       |              None              |                         配置SLANEXT时使用                          |
+| wireless_cell.model_dir_or_path  |       无线单元格模型地址       |              None              |                         配置SLANEXT时使用                          |
+|  wired_table.model_dir_or_path   |       有线表结构模型地址       |              None              |                         配置SLANEXT时使用                          |
+| wireless_table.model_dir_or_path |       无线表结构模型地址       |              None              |                         配置SLANEXT时使用                          |
 示例：
 
 ```python
 from rapid_doc.model.table.rapid_table_self import ModelType as TableModelType, EngineType as TableEngineType
 
 table_config = {
-    "force_ocr": False,  # 表格文字，是否强制使用ocr，默认 False 根据 parse_method 来判断是否需要ocr还是从pdf中直接提取文本
-    # 注：文字版pdf可以使用pypdfium2提取到表格内图片，扫描版或图片需要使用PP_DOCLAYOUT_PLUS_L版面识别模型，才能识别到表格内的图片
-    "skip_text_in_image": True, # 是否跳过表格里图片中的文字（如表格单元格中嵌入的图片、图标、扫描底图等）
-    "use_img2table": False, # 是否优先使用img2table库提取表格，需要手动安装（pip install img2table），基于opencv识别准确度不如使用模型，但是速度很快，默认关闭
-    "model_type": TableModelType.UNET_SLANET_PLUS,  # （默认） 有线表格使用unet，无线表格使用slanet_plus
+    # "force_ocr": False, # 表格文字，是否强制使用ocr，默认 False 根据 parse_method 来判断是否需要ocr还是从pdf中直接提取文本
+    # 注：文字版pdf可以使用pypdfium2提取到表格内图片，扫描版或图片需要使用PP_DOCLAYOUT_PLUS_L/PP_DOCLAYOUTV2版面识别模型，才能识别到表格内的图片
+    # "skip_text_in_image": True, # 是否跳过表格里图片中的文字（如表格单元格中嵌入的图片、图标、扫描底图等）
+    # "use_img2table": False, # 是否优先使用img2table库提取表格，需要手动安装（pip install img2table），基于opencv识别准确度不如使用模型，但是速度很快，默认关闭
+
+    # "model_type": TableModelType.SLANETPLUS,
+    # "model_type": TableModelType.UNET_SLANET_PLUS,  # （默认） 有线表格使用unet，无线表格使用slanet_plus
     # "model_type": TableModelType.UNET_UNITABLE, # 有线表格使用unet，无线表格使用unitable
+    # "model_type": TableModelType.UNITABLE,
+    # "model_dir_or_path": "", #单个模型使用。如SLANET_PLUS、UNITABLE
 
-    "model_dir_or_path": "",  # 单个模型使用。如SLANET_PLUS、UNITABLE
+    # "use_compare_table": False,  # 启用表格结果比较（同时跑有线/无线并比对），默认 False
+    # "table_formula_enable": False, # 表格内公式识别
+    # "table_image_enable": False, # 表格内图片识别
+    # "extract_original_image": False # 是否提取表格内原始图片，默认 False
+    # "cls.model_type": TableModelType.Q_CLS, # 表格分类模型
+    # "cls.model_dir_or_path": "", # 表格分类模型地址
+    # "unet.model_dir_or_path": "", # UNET表格模型地址
+    # "unitable.model_dir_or_path": "", # UNITABLE表格模型地址
+    # "slanet_plus.model_dir_or_path": "", # SLANET_PLUS表格模型地址
 
-    "cls.model_dir_or_path": "",  # 表格分类模型地址
-
-    "unet.model_dir_or_path": "",  # UNET表格模型地址
-
-    "unitable.model_dir_or_path": "",  # UNITABLE表格模型地址
-    "slanet_plus.model_dir_or_path": "",  # SLANET_PLUS表格模型地址
-    
-    "engine_type": TableEngineType.ONNXRUNTIME,  # 统一设置推理引擎
+    # "engine_type": TableEngineType.ONNXRUNTIME,  # 统一设置推理引擎
 }
 ```
 

@@ -12,10 +12,10 @@
 cd docker
 
 # 1. CPU 模式
-docker build -f Dockerfile -t hzkitty/rapid-doc:0.3.0 .
+docker build -f Dockerfile -t hzkitty/rapid-doc:0.6.1 .
 
 # 2. GPU 模式
-docker build -f DockerfileGPU -t hzkitty/rapid-doc:0.3.0-gpu .
+docker build -f DockerfileGPU -t hzkitty/rapid-doc:0.6.1-gpu .
 ```
 
 
@@ -72,4 +72,4 @@ curl -X POST "http://localhost:8888/parse" \
 |--------|--------|------|
 | `STARTUP_WAIT_TIME` | `15` | 启动等待时间（秒） |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
-| `MINERU_MODELS_DIR` | `/app/models` | 模型文件存储目录 |
+| `RAPID_MODELS_DIR` | `/app/models` | 模型文件存储目录 |

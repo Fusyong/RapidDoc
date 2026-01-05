@@ -37,8 +37,7 @@ dependencies = [
     "ftfy>=6.3.1,<7",
     "shapely>=2.0.7,<3",
     "tokenizers>=0.13.2",
-    "rapidocr>=3.1.0,<=3.4.2",
-    "magika>=0.6.2,<0.7.0",
+    "rapidocr>=3.4.0,<=3.4.3",
 ]
 
 [project.optional-dependencies]
@@ -50,7 +49,7 @@ test = [
 
 cpu = [
     "onnxruntime>=1.18.0",
-    "openvino>=2024.6.0",
+    "openvino>=2024.6.0,<=2025.4.0",
 ]
 
 gpu = [
@@ -65,10 +64,37 @@ api = [
     "python-multipart>=0.0.6",
 ]
 
+word = [
+    "python-docx>=0.8.10",
+    "pypandoc-binary",
+]
+
+html = [
+    "markdown-it-py",
+    "mdit-py-plugins",
+    "pygments",
+]
+
+gradio = [
+    "gradio>=5.34,<6",
+    "gradio-pdf>=0.0.22",
+]
+
 core = [
     "openvino>=2024.6.0",
-    "onnxruntime-gpu",
+    "onnxruntime-gpu<=1.23.0",
     "torch>=2.6.0,<3",
+    "torchvision",
+]
+
+npu = [
+    "numpy>=1.21.6,<2",
+    "decorator",
+    "attrs",
+    "psutil",
+    "onnxruntime-cann==1.22.0",
+    "torch==2.5.1",
+    "torch-npu==2.5.1",
     "torchvision",
 ]
 
