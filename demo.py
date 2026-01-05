@@ -16,6 +16,7 @@ from loguru import logger
 from rapid_doc.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2, prepare_env, read_fn
 from rapid_doc.data.data_reader_writer import FileBasedDataWriter
 from rapid_doc.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
+from rapid_doc.utils.layered_pdf_pypdf import create_layered_searchable_pdf
 from rapid_doc.utils.enum_class import MakeMode
 from rapid_doc.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
 from rapid_doc.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
@@ -36,6 +37,7 @@ def do_parse(
     p_table_enable=True,  # Enable table parsing
     f_draw_layout_bbox=True,  # Whether to draw layout bounding boxes
     f_draw_span_bbox=True,  # Whether to draw span bounding boxes
+    f_create_layered_pdf=True,  # Whether to create layered PDF
     f_dump_md=True,  # Whether to dump markdown files
     f_dump_middle_json=True,  # Whether to dump middle JSON files
     f_dump_model_output=True,  # Whether to dump model output files
@@ -44,6 +46,8 @@ def do_parse(
     f_make_md_mode=MakeMode.MM_MD,  # The mode for making markdown content, default is MM_MD
     start_page_id=0,  # Start page ID for parsing, default is 0
     end_page_id=None,  # End page ID for parsing, default is None (parse all pages until the end of the document)
+    f_include_footnotes=True,  # Whether to include footnotes in markdown output, default is True
+    f_include_page_numbers=True,  # Whether to include page number markers in markdown output, default is True
 ):
     layout_config = {
         # "model_type": LayoutModelType.PP_DOCLAYOUT_PLUS_L,
@@ -144,6 +148,9 @@ def do_parse(
         if f_draw_span_bbox:
             draw_span_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_span.pdf")
 
+        if f_create_layered_pdf:
+            create_layered_searchable_pdf(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_layered.pdf")
+
         if f_dump_orig_pdf:
             md_writer.write(
                 f"{pdf_file_name}_origin.pdf",
@@ -152,11 +159,18 @@ def do_parse(
 
         if f_dump_md:
             image_dir = str(os.path.basename(local_image_dir))
-            md_content_str = pipeline_union_make(pdf_info, f_make_md_mode, image_dir)
-            md_writer.write_string(
-                f"{pdf_file_name}.md",
-                md_content_str,
+            md_content_str = pipeline_union_make(
+                pdf_info, 
+                f_make_md_mode, 
+                image_dir,
+                include_footnotes=f_include_footnotes,
+                include_page_numbers=f_include_page_numbers
             )
+            if md_content_str is not None:
+                md_writer.write_string(
+                    f"{pdf_file_name}.md",
+                    md_content_str if isinstance(md_content_str, str) else str(md_content_str),
+                )
 
         if f_dump_content_list:
             image_dir = str(os.path.basename(local_image_dir))
@@ -185,7 +199,9 @@ def parse_doc(
         output_dir,
         method="auto",
         start_page_id=0,  # Start page ID for parsing, default is 0
-        end_page_id=None  # End page ID for parsing, default is None (parse all pages until the end of the document)
+        end_page_id=None,  # End page ID for parsing, default is None (parse all pages until the end of the document)
+        f_include_footnotes=True,  # Whether to include footnotes in markdown output, default is True
+        f_include_page_numbers=True,  # Whether to include page number markers in markdown output, default is True
 ):
     """
         Parameter description:
@@ -211,7 +227,9 @@ def parse_doc(
             pdf_bytes_list=pdf_bytes_list,
             parse_method=method,
             start_page_id=start_page_id,
-            end_page_id=end_page_id
+            end_page_id=end_page_id,
+            f_include_footnotes=f_include_footnotes,
+            f_include_page_numbers=f_include_page_numbers
         )
     except Exception as e:
         logger.exception(e)
@@ -222,11 +240,9 @@ if __name__ == '__main__':
     output_dir = os.path.join(__dir__, "output")
 
     doc_path_list = [
-        "demo/pdfs/示例1-论文模板.pdf",
-        "demo/pdfs/比亚迪财报.pdf",
-        "demo/images/table_05.png",
+        "E:/语文出版社/2025/走出课本学语文/二校/12.24 题画诗 发社- 未转曲.pdf",
     ]
     for doc_path in doc_path_list:
         start_time = time.time()
-        parse_doc([doc_path], output_dir)
+        parse_doc([Path(doc_path)], output_dir, method="txt")
         print(f"总运行时间: {time.time() - start_time}秒")

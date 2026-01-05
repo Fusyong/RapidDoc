@@ -268,23 +268,150 @@ def make_blocks_to_content_list(para_block, img_buket_path, page_idx, page_size)
     return para_content
 
 
+def _is_footnote_block(block, page_w=None, page_h=None):
+    """判断一个block是否为脚注块
+    脚注识别规则：
+    检查废弃块的 original_label 是否为 "footnote"
+    """
+    if block.get('type') != BlockType.DISCARDED:
+        return False
+    
+    # 首先检查 spans 中是否有 original_label 为 "footnote" 的
+    for line in block.get('lines', []):
+        for span in line.get('spans', []):
+            if span.get('original_label') == 'footnote':
+                return True
+    return False
+
+
+def _extract_footnote_text_from_line(line):
+    """从一行中提取文本内容（用于脚注）"""
+    line_text = ''
+    for span in line.get('spans', []):
+        if span['type'] in [ContentType.TEXT]:
+            content = span.get('content', '')
+            if content:
+                content = full_to_half(content)
+                line_text += content
+    return line_text.strip()
+
+
+def _format_footnotes_from_block(block) -> list[str]:
+    """从 block 的 lines 结构中提取脚注并格式化为标准 Markdown 脚注格式
+    
+    在合并成行之前，逐行检查行首是否有脚注标记（注释码），
+    如果有标记则提取标记，将该行剩余内容作为脚注内容；
+    如果没有标记，将该行内容合并到上一个脚注。
+    格式化为 [^标记]: 内容 格式
+    
+    Args:
+        block: 脚注 block，包含 lines 结构
+        
+    Returns:
+        格式化后的脚注列表，每个元素为 [^标记]: 内容 格式
+    """
+    if not block or not block.get('lines'):
+        return []
+    
+    formatted_footnotes = []
+    current_footnote = None
+    current_content = []
+    
+    # 匹配行首脚注标记的正则表达式：1-2个字母、数字或中文字符，后面跟空格
+    # 例如: "a ", "b ", "1 ", "① ", "一 ", "ab " 等
+    footnote_marker_pattern = re.compile(r'^([a-zA-Z0-9①②③④⑤⑥⑦⑧⑨⑩]{1,2})(\s.+)*')
+    
+    for line in block['lines']:
+        # 从 line 中提取文本内容
+        line_text = _extract_footnote_text_from_line(line)
+        if not line_text:
+            continue
+        
+        # 检查行首是否是新的脚注标记
+        match = footnote_marker_pattern.match(line_text)
+        if match:
+            # 如果之前有脚注，先保存
+            if current_footnote is not None:
+                content = ' '.join(current_content).strip()
+                if content:
+                    formatted_footnotes.append(f'[^{current_footnote}]: {content}')
+            
+            # 开始新的脚注
+            marker = match.group(1)
+            content_after_marker = line_text[match.end():].strip()
+            current_footnote = marker
+            current_content = [content_after_marker] if content_after_marker else []
+        else:
+            # 继续当前脚注的内容（合并到上一个脚注）
+            if current_footnote is not None:
+                current_content.append(line_text)
+            else:
+                # 没有当前脚注，且行首不是标记，跳过该行（不处理没有标记的脚注）
+                continue
+    
+    # 保存最后一个脚注
+    if current_footnote is not None:
+        content = ' '.join(current_content).strip()
+        if content:
+            formatted_footnotes.append(f'[^{current_footnote}]: {content}')
+    
+    return formatted_footnotes
+
+
 def union_make(pdf_info_dict: list,
                make_mode: str,
                img_buket_path: str = '',
+               include_footnotes: bool = True,
+               include_page_numbers: bool = True,
                ):
+    """
+    Args:
+        pdf_info_dict: PDF信息字典列表
+        make_mode: 生成模式
+        img_buket_path: 图片路径
+        include_footnotes: 是否包含脚注，默认True
+        include_page_numbers: 是否包含页码标记，默认True
+    """
     output_content = []
     for page_info in pdf_info_dict:
         paras_of_layout = page_info.get('para_blocks')
         paras_of_discarded = page_info.get('discarded_blocks')
         page_idx = page_info.get('page_idx')
         page_size = page_info.get('page_size')
+        if page_size and len(page_size) >= 2:
+            page_w, page_h = page_size[0], page_size[1]
+        else:
+            page_w, page_h = 0, 0
+        
         if not paras_of_layout:
             continue
         if make_mode in [MakeMode.MM_MD, MakeMode.NLP_MD]:
             if not paras_of_layout:
                 continue
+            
+            # 插入页码标记（在页面内容前）
+            if include_page_numbers:
+                page_number = page_idx + 1  # page_idx从0开始，页码从1开始
+                output_content.append(f'<!-- page {page_number} -->')
+            
             page_markdown = make_blocks_to_markdown(paras_of_layout, make_mode, img_buket_path)
             output_content.extend(page_markdown)
+            
+            # 处理脚注（在页面内容后）
+            if include_footnotes and paras_of_discarded:
+                formatted_footnotes = []
+                for discarded_block in paras_of_discarded:
+                    if _is_footnote_block(discarded_block, page_w, page_h):
+                        # 直接从 block 的 lines 结构中提取脚注（在合并之前）
+                        formatted = _format_footnotes_from_block(discarded_block)
+                        formatted_footnotes.extend(formatted)
+                
+                # 如果有脚注，添加到页面末尾
+                if formatted_footnotes:
+                    output_content.append('')  # 添加空行分隔
+                    output_content.append('<!-- footnote -->')
+                    output_content.extend(formatted_footnotes)
+                    
         elif make_mode == MakeMode.CONTENT_LIST:
             para_blocks = (paras_of_layout or []) + (paras_of_discarded or [])
             if not para_blocks:
