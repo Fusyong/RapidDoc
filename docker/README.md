@@ -12,10 +12,10 @@
 cd docker
 
 # 1. CPU 模式
-docker build -f Dockerfile -t hzkitty/rapid-doc:0.6.1 .
+docker build -f Dockerfile -t hzkitty/rapid-doc:0.7.0 .
 
 # 2. GPU 模式
-docker build -f DockerfileGPU -t hzkitty/rapid-doc:0.6.1-gpu .
+docker build -f DockerfileGPU -t hzkitty/rapid-doc:0.7.0-gpu .
 ```
 
 
@@ -61,9 +61,12 @@ curl -X POST "http://localhost:8888/parse" \
 
 #### 基础配置
 
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `API_PORT` | `8888` | RapidDoc Web API 端口 |
+| 变量名                                | 默认值      | 说明                   |
+|------------------------------------|----------|----------------------|
+| `API_PORT`                         | `8888`   | RapidDoc Web API 端口  |
+| `PADDLEOCRVL_VERSION`              |          | paddleocr-vl 版本      |
+| `PADDLEOCRVL_VL_REC_BACKEND`       |          | paddleocr-vl backend |
+| `PADDLEOCRVL_VL_VL_REC_SERVER_URL` |          | paddleocr-vl url     |
 
 
 ### 系统配置
