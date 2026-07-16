@@ -1,5 +1,7 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import os
+import atexit
+import threading
 import uuid
 from io import BytesIO
 
@@ -7,7 +9,7 @@ import numpy as np
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 from loguru import logger
-from PIL import Image
+from PIL import Image, ImageOps
 
 from rapid_doc.data.data_reader_writer import FileBasedDataWriter
 from rapid_doc.utils.check_sys_env import is_windows_environment
@@ -18,10 +20,75 @@ from rapid_doc.utils.hash_utils import str_sha256
 from rapid_doc.utils.pdf_page_id import get_end_page_id
 from rapid_doc.utils import PyPDFium2Parser
 from rapid_doc.utils.boxbase import calculate_iou
+from rapid_doc.utils.pdfium_guard import close_pdfium_child
 
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures.process import BrokenProcessPool
 import multiprocessing
 
+
+DEFAULT_PDF_IMAGE_DPI = 200
+DEFAULT_MAX_PDF_RENDER_PROCESSES = 3
+DEFAULT_MIN_PAGES_PER_RENDER_PROCESS = 30
+
+_pdf_render_executor = None
+_pdf_render_executor_lock = threading.Lock()
+
+
+def _get_positive_env_int(name, default):
+    try:
+        return max(1, int(os.getenv(name, default)))
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid {name}, fallback to {default}")
+        return default
+
+
+def _calculate_render_process_count(total_pages, requested_threads, cpu_count=None):
+    """按页数限制单个 PDF 占用的共享渲染 worker 数。"""
+    max_processes = _get_positive_env_int(
+        "MINERU_PDF_MAX_RENDER_PROCESSES", DEFAULT_MAX_PDF_RENDER_PROCESSES
+    )
+    min_pages = _get_positive_env_int(
+        "MINERU_PDF_MIN_PAGES_PER_RENDER_PROCESS",
+        DEFAULT_MIN_PAGES_PER_RENDER_PROCESS,
+    )
+    available_cpus = max(1, cpu_count if cpu_count is not None else (os.cpu_count() or 1))
+    processes_by_pages = max(1, (total_pages + min_pages - 1) // min_pages)
+    return min(max(1, requested_threads), max_processes, available_cpus, processes_by_pages)
+
+
+def _create_pdf_render_executor(max_workers):
+    """使用 spawn，避免 fork 继承 PDFium/ONNX/OpenCV 等 native 运行时状态。"""
+    if os.name != "nt" and multiprocessing.get_start_method() != "spawn":
+        return ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+    return ProcessPoolExecutor(max_workers=max_workers)
+
+
+def _get_pdf_render_executor(max_workers):
+    global _pdf_render_executor
+    with _pdf_render_executor_lock:
+        if _pdf_render_executor is None:
+            _pdf_render_executor = _create_pdf_render_executor(max_workers)
+        return _pdf_render_executor
+
+
+def shutdown_pdf_render_executor(wait=True):
+    """关闭共享渲染池；池损坏时可安全回收并在下次请求重建。"""
+    global _pdf_render_executor
+    with _pdf_render_executor_lock:
+        executor = _pdf_render_executor
+        _pdf_render_executor = None
+    if executor is not None:
+        try:
+            executor.shutdown(wait=wait, cancel_futures=True)
+        except Exception as exc:
+            logger.warning(f"Failed to shutdown PDF render executor: {exc}")
+
+
+atexit.register(shutdown_pdf_render_executor)
 
 def pdf_page_to_image(page: pdfium.PdfPage, dpi=200, image_type=ImageType.PIL) -> dict:
     """Convert pdfium.PdfDocument to image, Then convert the image to base64.
@@ -39,7 +106,10 @@ def pdf_page_to_image(page: pdfium.PdfPage, dpi=200, image_type=ImageType.PIL) -
         "scale": scale,
     }
     if image_type == ImageType.BASE64:
-        image_dict["img_base64"] = image_to_b64str(pil_img)
+        try:
+            image_dict["img_base64"] = image_to_b64str(pil_img)
+        finally:
+            pil_img.close()
     else:
         image_dict["img_pil"] = pil_img
 
@@ -74,7 +144,9 @@ def load_images_from_pdf(
     Raises:
         TimeoutError: 当转换超时时抛出
     """
-    pdf_doc = pdfium.PdfDocument(pdf_bytes)
+    with PyPDFium2Parser.lock:
+        pdf_doc = pdfium.PdfDocument(pdf_bytes)
+        pdf_doc_len = len(pdf_doc)
 
     concurrency_enabled = os.getenv('MINERU_PDF_CONCURRENCY_ENABLED', 'true')
     # 检测是否为 Windows 环境
@@ -86,19 +158,19 @@ def load_images_from_pdf(
             pdf_bytes,
             dpi,
             start_page_id,
-            get_end_page_id(end_page_id, len(pdf_doc)),
+            get_end_page_id(end_page_id, pdf_doc_len),
             image_type
         ), pdf_doc
     else:
         if timeout is None:
             timeout = get_load_images_timeout()
-        end_page_id = get_end_page_id(end_page_id, len(pdf_doc))
+        end_page_id = get_end_page_id(end_page_id, pdf_doc_len)
 
         # 计算总页数
         total_pages = end_page_id - start_page_id + 1
 
-        # 实际使用的进程数不超过总页数
-        actual_threads = min(os.cpu_count() or 1, threads, total_pages)
+        # 共享池限制容器内总进程数；短 PDF 不再为每一页创建一个进程。
+        actual_threads = _calculate_render_process_count(total_pages, threads)
 
         # 根据实际进程数分组页面范围
         pages_per_thread = max(1, total_pages // actual_threads)
@@ -116,9 +188,13 @@ def load_images_from_pdf(
 
         logger.info(f"PDF to images using {actual_threads} processes, page ranges: {page_ranges}")
 
-        with ProcessPoolExecutor(max_workers=actual_threads) as executor:
-            # 提交所有任务
-            futures = []
+        executor = _get_pdf_render_executor(
+            _get_positive_env_int(
+                "MINERU_PDF_MAX_RENDER_PROCESSES", DEFAULT_MAX_PDF_RENDER_PROCESSES
+            )
+        )
+        futures = []
+        try:
             for range_start, range_end in page_ranges:
                 future = executor.submit(
                     _load_images_from_pdf_worker,
@@ -130,24 +206,32 @@ def load_images_from_pdf(
                 )
                 futures.append((range_start, future))
 
-            try:
-                # 收集结果并按页码排序
-                all_results = []
-                for range_start, future in futures:
-                    images_list = future.result(timeout=timeout)
-                    all_results.append((range_start, images_list))
+            # 收集结果并按页码排序
+            all_results = []
+            for range_start, future in futures:
+                images_list = future.result(timeout=timeout)
+                all_results.append((range_start, images_list))
 
-                # 按起始页码排序并合并结果
-                all_results.sort(key=lambda x: x[0])
-                images_list = []
-                for _, imgs in all_results:
-                    images_list.extend(imgs)
+            all_results.sort(key=lambda x: x[0])
+            images_list = []
+            for _, imgs in all_results:
+                images_list.extend(imgs)
 
-                return images_list, pdf_doc
-            except FuturesTimeoutError:
+            return images_list, pdf_doc
+        except FuturesTimeoutError:
+            with PyPDFium2Parser.lock:
                 pdf_doc.close()
-                executor.shutdown(wait=False, cancel_futures=True)
-                raise TimeoutError(f"PDF to images conversion timeout after {timeout}s")
+            shutdown_pdf_render_executor(wait=False)
+            raise TimeoutError(f"PDF to images conversion timeout after {timeout}s")
+        except BrokenProcessPool:
+            with PyPDFium2Parser.lock:
+                pdf_doc.close()
+            shutdown_pdf_render_executor(wait=False)
+            raise
+        except Exception:
+            with PyPDFium2Parser.lock:
+                pdf_doc.close()
+            raise
 
 def load_images_from_pdf_core(
     pdf_bytes: bytes,
@@ -157,17 +241,27 @@ def load_images_from_pdf_core(
     image_type=ImageType.PIL,  # PIL or BASE64
 ):
     images_list = []
-    pdf_doc = pdfium.PdfDocument(pdf_bytes)
-    pdf_page_num = len(pdf_doc)
-    end_page_id = get_end_page_id(end_page_id, pdf_page_num)
+    with PyPDFium2Parser.lock:
+        pdf_doc = pdfium.PdfDocument(pdf_bytes)
+        pdf_page_num = len(pdf_doc)
+        end_page_id = get_end_page_id(end_page_id, pdf_page_num)
 
-    for index in range(start_page_id, end_page_id + 1):
-        # logger.debug(f"Converting page {index}/{pdf_page_num} to image")
-        page = pdf_doc[index]
-        image_dict = pdf_page_to_image(page, dpi=dpi, image_type=image_type)
-        images_list.append(image_dict)
-
-    pdf_doc.close()
+    try:
+        for index in range(start_page_id, end_page_id + 1):
+            # logger.debug(f"Converting page {index}/{pdf_page_num} to image")
+            page = None
+            with PyPDFium2Parser.lock:
+                page = pdf_doc[index]
+            try:
+                image_dict = pdf_page_to_image(page, dpi=dpi, image_type=image_type)
+                images_list.append(image_dict)
+            finally:
+                if page is not None:
+                    with PyPDFium2Parser.lock:
+                        page.close()
+    finally:
+        with PyPDFium2Parser.lock:
+            pdf_doc.close()
 
     return images_list
 
@@ -212,7 +306,7 @@ def get_crop_img(bbox: tuple, pil_img, scale=2):
     return pil_img.crop(scale_bbox)
 
 
-def get_crop_np_img(bbox: tuple, input_img, scale=2):
+def get_crop_np_img(bbox: tuple, input_img, scale=2, return_list=False):
 
     if isinstance(input_img, Image.Image):
         np_img = np.asarray(input_img)
@@ -227,6 +321,12 @@ def get_crop_np_img(bbox: tuple, input_img, scale=2):
         int(bbox[2] * scale),
         int(bbox[3] * scale),
     )
+    if return_list:
+        crop_xmin, crop_ymin, crop_xmax, crop_ymax = scale_bbox
+        cropped_img = np_img[crop_ymin:crop_ymax, crop_xmin:crop_xmax]
+        crop_new_height, crop_new_width = cropped_img.shape[:2]
+        return_list = [0, 0, crop_xmin, crop_ymin, crop_xmax, crop_ymax, crop_new_width, crop_new_height]
+        return np_img[scale_bbox[1]:scale_bbox[3], scale_bbox[0]:scale_bbox[2]], return_list
 
     return np_img[scale_bbox[1]:scale_bbox[3], scale_bbox[0]:scale_bbox[2]]
 
@@ -235,10 +335,21 @@ def images_bytes_to_pdf_bytes(image_bytes):
     pdf_buffer = BytesIO()
 
     # 载入并转换所有图像为 RGB 模式
-    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    image = Image.open(BytesIO(image_bytes))
+    # 根据 EXIF 信息自动转正（处理手机拍摄的带 Orientation 标记的图片）
+    image = ImageOps.exif_transpose(image) or image
+    # 只在必要时转换
+    if image.mode != "RGB":
+        image = image.convert("RGB")
 
     # 第一张图保存为 PDF，其余追加
-    image.save(pdf_buffer, format="PDF", save_all=True)
+    image.save(
+        pdf_buffer,
+        format="PDF",
+        resolution=DEFAULT_PDF_IMAGE_DPI,
+        quality=95,
+        subsampling=0,
+    )
 
     # 获取 PDF bytes 并重置指针（可选）
     pdf_bytes = pdf_buffer.getvalue()
@@ -272,30 +383,27 @@ def get_ori_image(
     images_list = []
     for image in images:
         # === 获取 bbox ===
-        bbox, pil_image = None, None
+        bbox, pil_image, bitmap = None, None, None
         try:
-            # PDF页面坐标系 左下角原点坐标 (x1, y1, x2, y2)
-            x1, y1, x2, y2 = image.get_pos()
-            page_width, page_height = page.get_size()
+            with PyPDFium2Parser.lock:
+                # PDF页面坐标系 左下角原点坐标 (x1, y1, x2, y2)
+                x1, y1, x2, y2 = image.get_pos()
+                page_width, page_height = page.get_size()
 
-            width = abs(x2 - x1)
-            height = abs(y2 - y1)
-            # 过滤掉“点状”小图像
-            MIN_IMAGE_WIDTH = 5
-            MIN_IMAGE_HEIGHT = 5
-            if width < MIN_IMAGE_WIDTH or height < MIN_IMAGE_HEIGHT:
-                image.close()
-                continue
-            # 转换为左上角原点坐标
-            new_x1 = x1
-            new_x2 = x2
-            new_y1 = page_height - y2
-            new_y2 = page_height - y1
+                width = abs(x2 - x1)
+                height = abs(y2 - y1)
+                # 过滤掉“点状”小图像
+                MIN_IMAGE_WIDTH = 5
+                MIN_IMAGE_HEIGHT = 5
+                if width < MIN_IMAGE_WIDTH or height < MIN_IMAGE_HEIGHT:
+                    continue
+                # 转换为左上角原点坐标
+                new_x1 = x1
+                new_x2 = x2
+                new_y1 = page_height - y2
+                new_y2 = page_height - y1
 
-            bbox = [new_x1, new_y1, new_x2, new_y2]
-        except Exception:
-            pass
-        try:
+                bbox = [new_x1, new_y1, new_x2, new_y2]
             # ❶ 检查是否支持 scale_to_original 参数
             from inspect import signature
             sig = signature(image.get_bitmap)
@@ -304,11 +412,15 @@ def get_ori_image(
                 kwargs["render"] = render
             if "scale_to_original" in sig.parameters:
                 kwargs["scale_to_original"] = scale_to_original
-            pil_image = image.get_bitmap(**kwargs).to_pil()
+            with PyPDFium2Parser.lock:
+                bitmap = image.get_bitmap(**kwargs)
+                # PIL 对象必须脱离 PdfBitmap 的 native 缓冲区后才能关闭 bitmap。
+                pil_image = bitmap.to_pil().copy()
         except Exception:
             pass
         finally:
-            image.close()
+            close_pdfium_child(bitmap)
+            close_pdfium_child(image)
         if bbox and pil_image:
             images_list.append({
                 "uuid": str(uuid.uuid4()),

@@ -89,7 +89,7 @@ def remove_overlaps_low_confidence_spans(spans):
 
 def remove_overlaps_min_spans(spans):
     dropped_spans = []
-    #  删除重叠spans中较小的那些
+    # 删除重叠 spans 中较小的那些
     for span1 in spans:
         for span2 in spans:
             if span1 != span2:
@@ -97,11 +97,27 @@ def remove_overlaps_min_spans(spans):
                 if span1 in dropped_spans or span2 in dropped_spans:
                     continue
                 else:
-                    overlap_box = get_minbox_if_overlap_by_ratio(span1['bbox'], span2['bbox'], 0.65)
+                    overlap_box = get_minbox_if_overlap_by_ratio(
+                        span1['bbox'], span2['bbox'], 0.65
+                    )
                     if overlap_box is not None:
-                        span_need_remove = next((span for span in spans if span['bbox'] == overlap_box), None)
-                        if span_need_remove is not None and span_need_remove not in dropped_spans:
+                        # 如果重叠双方任意一个是 seal，则不要删除
+                        if span1.get("original_label") == "seal" or span2.get("original_label") == "seal":
+                            continue
+
+                        span_need_remove = next(
+                            (span for span in spans if span['bbox'] == overlap_box),
+                            None
+                        )
+
+                        # 如果待删除的是 seal，也不要删除
+                        if (
+                            span_need_remove is not None
+                            and span_need_remove not in dropped_spans
+                            and span_need_remove.get("original_label") != "seal"
+                        ):
                             dropped_spans.append(span_need_remove)
+
     if len(dropped_spans) > 0:
         for span_need_remove in dropped_spans:
             spans.remove(span_need_remove)
@@ -145,10 +161,10 @@ def txt_spans_bbox_extract(page_dict, input_res, mfd_res, scale, useful_list):
     # 转换为和ocr-det一样的格式
     for bbox in page_text_bbox:
         bbox = [bbox[0]*scale, bbox[1]*scale, bbox[2]*scale, bbox[3]*scale]
-        p1 = [bbox[0] + paste_x - xmin, bbox[1] + paste_y - ymin]
-        p2 = [bbox[2] + paste_x - xmin, bbox[1] + paste_y - ymin]
-        p3 = [bbox[2] + paste_x - xmin, bbox[3] + paste_y - ymin]
-        p4 = [bbox[0] + paste_x - xmin, bbox[3] + paste_y - ymin]
+        p1 = [round(bbox[0] + paste_x - xmin, 2), round(bbox[1] + paste_y - ymin, 2)]
+        p2 = [round(bbox[2] + paste_x - xmin, 2), round(bbox[1] + paste_y - ymin, 2)]
+        p3 = [round(bbox[2] + paste_x - xmin, 2), round(bbox[3] + paste_y - ymin, 2)]
+        p4 = [round(bbox[0] + paste_x - xmin, 2), round(bbox[3] + paste_y - ymin, 2)]
         bbox = [p1, p2, p3, p4]
         dt_boxes.append(bbox)
     # 根据公式位置更新检测框
@@ -184,7 +200,7 @@ def txt_most_angle_extract_table(page_dict, table_res_dict, scale):
         most_angle = angle_counts.most_common(1)[0][0]  # 取最多的角度
     else:
         most_angle = 0
-    return most_angle
+    return str(most_angle), angles
 
 """判断是否是背景图（背景图片里有文字）"""
 def txt_in_ori_image(page_dict, ori_image_bbox):
@@ -334,8 +350,8 @@ def txt_spans_extract(pdf_page_or_dict, spans, input_img, scale, all_bboxes, all
                 spans.remove(span)
                 continue
             span_img = cv2.cvtColor(span_pil_img, cv2.COLOR_RGB2BGR)
-            # 计算span的对比度，低于0.20的span不进行ocr
-            if calculate_contrast(span_img, img_mode='bgr') <= 0.17:
+            # 计算span的对比度，低于0.17的span不进行ocr，等于0.17的临界框保留给后置OCR。
+            if calculate_contrast(span_img, img_mode='bgr') < 0.17:
                 spans.remove(span)
                 continue
 

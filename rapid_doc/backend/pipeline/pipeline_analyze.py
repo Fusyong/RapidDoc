@@ -5,6 +5,7 @@ from PIL import Image
 from loguru import logger
 
 from .model_init import MineruPipelineModel
+from ...cli.common import convert_pdf_to_bytes_by_pypdfium2
 from ...utils.config_reader import get_device
 from ...utils.enum_class import ImageType
 from ...utils.hash_utils import make_hashable
@@ -12,6 +13,8 @@ from ...utils.pdf_classify import classify
 from ...utils.pdf_image_tools import load_images_from_pdf, get_ori_image
 from ...utils.model_utils import get_vram, clean_memory
 from ...utils.pdf_text_tool import get_page
+from ...utils import PyPDFium2Parser
+from ...utils.pdfium_guard import close_pdfium_child, close_pdfium_document
 
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # 让mps可以fallback
 os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'  # 禁止albumentations检查更新
@@ -87,7 +90,7 @@ def custom_model_init(
 
 
 def doc_analyze(
-        pdf_bytes_list,
+        pdf_bytes_list_all,
         lang_list: list[str] = None,
         parse_method: str = 'auto',
         formula_enable=True,
@@ -97,7 +100,17 @@ def doc_analyze(
         formula_config=None,
         table_config=None,
         checkbox_config=None,
+        start_page_id=None, end_page_id=None, pdf_pages_batch=None
 ):
+    file_end_list = []
+    if pdf_pages_batch:
+        pdf_bytes_list = []
+        for idx, pdf_bytes in enumerate(pdf_bytes_list_all):
+            new_pdf_bytes, file_end = convert_pdf_to_bytes_by_pypdfium2(pdf_bytes, start_page_id, end_page_id, pdf_pages_batch)
+            pdf_bytes_list.append(new_pdf_bytes)
+            file_end_list.append(file_end)
+    else:
+        pdf_bytes_list = pdf_bytes_list_all
     """
     适当调大MIN_BATCH_INFERENCE_SIZE可以提高性能，更大的 MIN_BATCH_INFERENCE_SIZE会消耗更多内存，
     可通过环境变量MINERU_MIN_BATCH_INFERENCE_SIZE设置，默认值为384。
@@ -153,18 +166,43 @@ def doc_analyze(
             if original_image_list[pdf_idx].size != (pdf_img_width, pdf_img_height):
                 # Resize原图以匹配PDF转图片的尺寸
                 images_list[0]['img_pil'] = original_image_list[pdf_idx].resize((pdf_img_width, pdf_img_height), Image.Resampling.LANCZOS)
-        all_image_lists.append(images_list)
-
         all_pdf_dict = []
-        for pdf_doc in pdf_doc_list:
-            # 获取pdf的文字和图片的字典对象
-            page_dict = get_page(pdf_doc)
-            if page_dict['blocks']:
-                page_dict['ori_image_list'] = get_ori_image(pdf_doc) # 从 PDF 中提取所有原始图片
-            else:
-                page_dict['ori_image_list'] = [] # 提取不到文字视为扫描版，不需要提取图片
-            pdf_doc.close()
-            all_pdf_dict.append(page_dict)
+        try:
+            with PyPDFium2Parser.lock:
+                pdf_page_count = len(pdf_doc_list)
+            for page_index in range(pdf_page_count):
+                pdf_page = None
+                try:
+                    with PyPDFium2Parser.lock:
+                        pdf_page = pdf_doc_list[page_index]
+                    # 获取pdf的文字和图片的字典对象
+                    page_dict = get_page(pdf_page)
+                    if not _ocr_enable and page_dict['blocks']:
+                        from rapid_doc.utils.pdf_text_tool import get_page_vector_lines
+                        page_dict['vector_lines'] = get_page_vector_lines(pdf_page)
+                    if page_dict['blocks']:
+                        page_dict['ori_image_list'] = get_ori_image(pdf_page) # 从 PDF 中提取所有原始图片
+                    else:
+                        page_dict['ori_image_list'] = [] # 提取不到文字视为扫描版，不需要提取图片
+                    all_pdf_dict.append(page_dict)
+                finally:
+                    close_pdfium_child(pdf_page)
+        except Exception:
+            # 本轮不会返回这些图片，立即释放 PIL/native 缓冲区。
+            for image_dict in images_list:
+                pil_image = image_dict.get('img_pil')
+                if pil_image is not None:
+                    pil_image.close()
+            for page_dict in all_pdf_dict:
+                for image_dict in page_dict.get('ori_image_list', []):
+                    pil_image = image_dict.get('pil_image')
+                    if pil_image is not None:
+                        pil_image.close()
+            raise
+        finally:
+            close_pdfium_document(pdf_doc_list)
+
+        all_image_lists.append(images_list)
         all_pdf_docs.append(all_pdf_dict)
         for page_idx in range(len(images_list)):
             img_dict = images_list[page_idx]
@@ -208,8 +246,10 @@ def doc_analyze(
 
         infer_results[pdf_idx].append(page_dict)
 
-    return infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list
-
+    if pdf_pages_batch:
+        return infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list, file_end_list
+    else:
+        return infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list
 
 def batch_image_analyze(
         images_with_extra_info: List[Tuple[Image.Image, float, bool, str, dict]],

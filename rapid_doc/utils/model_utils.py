@@ -2,6 +2,7 @@ import os
 import time
 import gc
 import uuid
+import platform
 
 import cv2
 from PIL import Image
@@ -22,17 +23,68 @@ def import_package(name, package=None):
     except ModuleNotFoundError:
         return None
 
-def check_openvino():
+
+def _cpu_vendor_from_text(text):
+    text = (text or "").lower()
+    if any(keyword in text for keyword in ("genuineintel", "intel(r)", "intel64", "intel ")):
+        return "intel"
+    if any(keyword in text for keyword in ("authenticamd", "amd", "ryzen", "epyc", "threadripper")):
+        return "amd"
+    if "apple" in text:
+        return "apple"
+    return None
+
+
+def get_cpu_vendor():
     """
-    检查当前环境是否支持 OpenVINO
+    获取当前 CPU 厂商，无法识别时返回 None。
     """
+    candidates = [
+        os.getenv("PROCESSOR_IDENTIFIER", ""),
+        platform.processor(),
+        platform.uname().processor,
+    ]
+
+    if os.path.exists("/proc/cpuinfo"):
+        try:
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+                candidates.append(f.read(4096))
+        except OSError:
+            pass
+
+    for candidate in candidates:
+        vendor = _cpu_vendor_from_text(candidate)
+        if vendor:
+            return vendor
+    return None
+
+
+def check_openvino(target_device="CPU", require_intel_cpu=True):
+    """
+    检查当前环境是否适合作为默认 OpenVINO 推理后端。
+
+    默认只在 Intel CPU 上启用 CPU OpenVINO，避免 AMD/Apple/未知 CPU
+    因为运行时可导入而被自动切到 OpenVINO。
+    """
+    target_device = (target_device or "").upper()
+    if target_device == "CPU" and require_intel_cpu:
+        cpu_vendor = get_cpu_vendor()
+        if cpu_vendor != "intel":
+            logger.info(f"Skip OpenVINO auto selection: CPU vendor is {cpu_vendor or 'unknown'}")
+            return False
+
     try:
-        from openvino.runtime import Core
+        try:
+            from openvino import Core
+        except ImportError:
+            from openvino.runtime import Core  # 兼容旧版本
         core = Core()
-        devices = core.available_devices
+        devices = [str(device).upper() for device in core.available_devices]
+        if target_device:
+            return target_device in devices
         return bool(devices)
     except Exception as e:
-        print(f"OpenVINO 可用性检查出错: {e}")
+        logger.warning(f"OpenVINO 可用性检查出错: {e}")
         return False
 
 def crop_img(input_res, input_img: np.ndarray, crop_paste_x=0, crop_paste_y=0, layout_shape_mode="auto"):
@@ -123,7 +175,7 @@ def get_res_list_from_layout_res(layout_res, np_img, overlap_threshold=0.8):
             res['bbox'] = [int(res['poly'][0]), int(res['poly'][1]), int(res['poly'][4]), int(res['poly'][5])]
             single_page_mfdetrec_res.append(res)
         # elif category_id in [0, 2, 4, 6, 7, 3]:  # OCR regions # 相信版面结果，图片就是图片，不再尝试转为文本块
-        elif category_id in [0, 1, 2, 4, 6, 7]:  # OCR regions
+        elif category_id in [0, 1, 2, 4, 6, 7, 9]:  # OCR regions
             ocr_res_list.append(res)
         elif category_id == 5:  # Table regions
             table_res_list.append(res)

@@ -1,2 +1,2 @@
-__version__ = "0.7.0"
-__mineru_version__ = "2.6.4"
+__version__ = "0.9.9"
+__mineru_version__ = "3.4.4"

@@ -1,4 +1,5 @@
 import time
+from copy import deepcopy
 from typing import Optional, Union, List
 
 import cv2
@@ -19,21 +20,33 @@ class TableCls:
         if cfg is None:
             cfg = RapidTableInput()
         if not cfg.model_type:
-            cfg.model_type = ModelType.Q_CLS
+            cfg.model_type = ModelType.PADDLE_CLS
 
-        if not cfg.model_dir_or_path and cfg.model_type is not None:
+        if not cfg.model_dir_or_path and cfg.model_type is not None and cfg.model_type != ModelType.PADDLE_Q_CLS:
             cfg.model_dir_or_path = ModelProcessor.get_model_path(cfg.model_type)
 
+        self.table_engine2 = None
         if cfg.model_type == ModelType.Q_CLS:
             self.table_engine = QanythingCls(asdict(cfg))
         elif cfg.model_type == ModelType.PADDLE_CLS:
             self.table_engine = PaddleCls(asdict(cfg))
+        elif cfg.model_type == ModelType.PADDLE_Q_CLS:
+            cfg2 = deepcopy(cfg)
+            if not cfg.model_dir_or_path:
+                cfg.model_dir_or_path = ModelProcessor.get_model_path(ModelType.PADDLE_CLS)
+                cfg2.model_dir_or_path = ModelProcessor.get_model_path(ModelType.Q_CLS)
+            elif isinstance(cfg.model_dir_or_path, dict):
+                cfg.model_dir_or_path = cfg.model_dir_or_path.get(ModelType.PADDLE_CLS.value)
+                cfg2.model_dir_or_path = cfg2.model_dir_or_path.get(ModelType.Q_CLS.value)
+            self.table_engine = PaddleCls(asdict(cfg))
+            self.table_engine2 = QanythingCls(asdict(cfg2))
 
         self.load_img = LoadImage()
 
-    def __call__(self, img_contents: Union[List[InputType], InputType], batch_size: int = 1, tqdm_enable=False):
+    def __call__(self, img_contents: Union[List[InputType], InputType], batch_size: int = 4, tqdm_enable=False, return_scores=False):
         ss = time.perf_counter()
         label_res = []
+        score_res = []
         if not isinstance(img_contents, list):
             img_contents = [img_contents]
         total_nums = len(img_contents)
@@ -41,9 +54,26 @@ class TableCls:
             end_i = min(total_nums, start_i + batch_size)
             imgs = self._load_imgs(img_contents[start_i:end_i])
             x = self.table_engine.batch_preprocess(imgs)
-            predict_cla = self.table_engine(x)
+            predict_cla, predict_score = self.table_engine.predict_with_scores(x)
+            if self.table_engine2 is not None:
+                x2 = self.table_engine2.batch_preprocess(imgs)
+                predict_cla2, predict_score2 = self.table_engine2.predict_with_scores(x2)
+                merged_cla = []
+                merged_score = []
+                for cla1, score1, cla2, score2 in zip(predict_cla, predict_score, predict_cla2, predict_score2):
+                    if cla1 == cla2:
+                        merged_cla.append(cla1)
+                        merged_score.append(min(score1, score2))
+                    else:
+                        merged_cla.append("wireless")
+                        merged_score.append(min(score1, score2))
+                predict_cla = merged_cla
+                predict_score = merged_score
             label_res.extend(predict_cla)
+            score_res.extend(predict_score)
         table_elapse = time.perf_counter() - ss
+        if return_scores:
+            return label_res, score_res, table_elapse
         return label_res, table_elapse
 
     def _load_imgs(
@@ -92,9 +122,16 @@ class PaddleCls:
         return x
 
     def __call__(self, img):
+        labels, _ = self.predict_with_scores(img)
+        return labels
+
+    def predict_with_scores(self, img):
         pred_output = self.session(img)[0]
-        pred_idxs = list(np.argmax(pred_output, axis=1))
-        return [self.cls[idx] for idx in pred_idxs]
+        predict = np.exp(pred_output - np.max(pred_output, axis=1, keepdims=True))
+        predict /= np.sum(predict, axis=1, keepdims=True)
+        pred_idxs = np.argmax(predict, axis=1).tolist()
+        scores = np.max(predict, axis=1).astype(float).tolist()
+        return [self.cls[int(idx)] for idx in pred_idxs], scores
 
 
 class QanythingCls:
@@ -130,6 +167,13 @@ class QanythingCls:
         """
         img_batch shape: (N, 3, H, W)
         """
+        labels, _ = self.predict_with_scores(img_batch)
+        return labels
+
+    def predict_with_scores(self, img_batch):
+        """
+        img_batch shape: (N, 3, H, W)
+        """
         output = self.session(img_batch)[0]  # (N, num_classes)
 
         # softmax
@@ -138,5 +182,6 @@ class QanythingCls:
 
         # batch argmax
         pred_idxs = np.argmax(predict, axis=1).tolist()
+        scores = np.max(predict, axis=1).astype(float).tolist()
 
-        return [self.cls[int(idx)] for idx in pred_idxs]
+        return [self.cls[int(idx)] for idx in pred_idxs], scores

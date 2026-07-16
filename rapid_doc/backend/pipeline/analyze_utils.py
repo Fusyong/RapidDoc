@@ -13,7 +13,10 @@ from tqdm import tqdm
 
 from .model_init import AtomModelSingleton
 from .model_list import AtomicModel
-from ...utils.boxbase import rotate_image
+from ...model.table.utils import normalize_table_ocr_text
+from ...model.table.rule_table import build_rule_table, build_track_table
+from ...utils.bbox_utils import normalize_to_int_bbox
+from ...utils.boxbase import rotate_table_image
 from ...utils.enum_class import CategoryId
 from ...utils.model_utils import crop_img
 from ...utils.ocr_utils import (
@@ -47,6 +50,9 @@ def _extract_text_from_pdf(
             for ocr_res_dict in text_list:
                 if ocr_res_dict['ocr_enable']:
                     continue
+                if page_dict.get("rotate_label") in ["90", "180", "270"]:
+                    ocr_res_dict['ocr_enable'] = True
+                    continue
 
                 for res in ocr_res_dict['ocr_res_list']:
                     new_image, useful_list = crop_img(
@@ -74,6 +80,28 @@ def _extract_text_from_pdf(
 
                 pbar.update(1)
 
+def _apply_mask_boxes_to_image(
+    bgr_image: np.ndarray,
+    mask_boxes: list[dict] | None,
+) -> np.ndarray:
+    if not mask_boxes:
+        return bgr_image
+
+    masked_image = bgr_image.copy()
+    image_h, image_w = masked_image.shape[:2]
+    for mask_box in mask_boxes:
+        bbox = mask_box.get("bbox")
+        if bbox is None:
+            continue
+
+        int_bbox = normalize_to_int_bbox(bbox, image_size=(image_h, image_w))
+        if int_bbox is None:
+            continue
+
+        x0, y0, x1, y1 = int_bbox
+        masked_image[y0:y1, x0:x1] = 255
+
+    return masked_image
 
 def _run_ocr_det_batch(
         ocr_res_all_page: List[Dict],
@@ -109,10 +137,14 @@ def _run_ocr_det_batch(
             )
 
             bgr_image = cv2.cvtColor(new_image, cv2.COLOR_RGB2BGR)
+            det_image = _apply_mask_boxes_to_image(
+                bgr_image,
+                adjusted_mfdetrec_res,
+            )
 
             all_cropped_info.append((
-                bgr_image, useful_list, ocr_res_dict, res,
-                adjusted_mfdetrec_res, ocr_res_dict['lang'], ocr_enable
+                bgr_image, det_image, useful_list, ocr_res_dict,
+                adjusted_mfdetrec_res, ocr_res_dict['lang'], res, ocr_enable
             ))
 
     if not all_cropped_info:
@@ -131,7 +163,6 @@ def _run_ocr_det_batch(
 
         ocr_model = atom_model_manager.get_atom_model(
             atom_model_name=AtomicModel.OCR,
-            det_db_box_thresh=0.3,
             lang=lang,
             ocr_config=ocr_config,
         )
@@ -139,16 +170,19 @@ def _run_ocr_det_batch(
         # 按分辨率分组
         resolution_groups = defaultdict(list)
         for info in lang_crop_list:
-            h, w = info[0].shape[:2]
+            cropped_img = info[1]
+            h, w = cropped_img.shape[:2]
+            # 直接计算目标尺寸并用作分组键
             target_h = ((h + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE
             target_w = ((w + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE
-            resolution_groups[(target_h, target_w)].append(info)
+            group_key = (target_h, target_w)
+            resolution_groups[group_key].append(info)
 
-        # 批量处理
+        # 对每个分辨率组进行批处理
         for (target_h, target_w), group_crops in tqdm(resolution_groups.items(), desc=f"OCR-det {lang}"):
             batch_images = []
             for info in group_crops:
-                img = info[0]
+                img = info[1] # _det_image
                 h, w = img.shape[:2]
                 padded_img = np.ones((target_h, target_w, 3), dtype=np.uint8) * 255
                 padded_img[:h, :w] = img
@@ -158,7 +192,7 @@ def _run_ocr_det_batch(
             batch_results = ocr_model.det_batch_predict(batch_images, det_batch_size)
 
             for info, (dt_boxes, _) in zip(group_crops, batch_results):
-                bgr_image, useful_list, ocr_res_dict, res, adjusted_mfdetrec_res, _lang, ocr_enable = info
+                bgr_image, _det_image, useful_list, ocr_res_dict, adjusted_mfdetrec_res, _lang, res, ocr_enable = info
 
                 if dt_boxes is not None and len(dt_boxes) > 0:
                     dt_boxes_sorted = sorted_boxes(dt_boxes)
@@ -212,12 +246,33 @@ def _run_ocr_rec_postprocess(images_layout_res: List[List[Dict]], ocr_config):
 
         ocr_model = atom_model_manager.get_atom_model(
             atom_model_name=AtomicModel.OCR,
-            det_db_box_thresh=0.3,
             lang=lang,
             ocr_config=ocr_config,
         )
 
-        ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
+        try:
+            ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
+        except Exception as exc:
+            logger.warning(f'OCR-rec batch failed, retry one by one: {exc}')
+            ocr_res_list = []
+            safe_items = []
+            for item, img_crop in zip(need_ocr_by_lang[lang], img_crop_list):
+                try:
+                    one_res = ocr_model.ocr([img_crop], det=False, tqdm_enable=False)[0]
+                except Exception as one_exc:
+                    logger.warning(f'skip failed OCR-rec crop: {one_exc}')
+                    item['text'] = ''
+                    item['score'] = 0.0
+                    item['category_id'] = CategoryId.LowScoreText
+                    continue
+                if not one_res:
+                    item['text'] = ''
+                    item['score'] = 0.0
+                    item['category_id'] = CategoryId.LowScoreText
+                    continue
+                ocr_res_list.append(one_res[0])
+                safe_items.append(item)
+            need_ocr_by_lang[lang] = safe_items
 
         assert len(ocr_res_list) == len(need_ocr_by_lang[lang])
 
@@ -238,6 +293,45 @@ def _run_ocr_rec_postprocess(images_layout_res: List[List[Dict]], ocr_config):
                     item['category_id'] = CategoryId.LowScoreText
 
 # =================================== OCR-rec ===================================
+def _detect_table_text(
+        ocr_model,
+        det_image: np.ndarray,
+        mfd_res,
+        retry_padding: int = 8,
+        retry_short_side: int = 32,
+):
+    """Detect table text, retrying boundary-clipped thin crops with white padding."""
+    det_res = ocr_model.ocr(det_image, mfd_res=mfd_res, rec=False)[0]
+    if det_res is not None and len(det_res) > 0:
+        return det_res
+
+    height, width = det_image.shape[:2]
+    padding = max(0, int(retry_padding))
+    if padding == 0 or min(height, width) >= int(retry_short_side):
+        return det_res
+
+    padded_image = cv2.copyMakeBorder(
+        det_image,
+        padding, padding, padding, padding,
+        cv2.BORDER_CONSTANT,
+        value=(255, 255, 255),
+    )
+    # Formula regions are already masked in det_image. Omitting mfd_res here
+    # avoids mixing original-image coordinates with the padded retry image.
+    padded_res = ocr_model.ocr(padded_image, mfd_res=None, rec=False)[0]
+    if padded_res is None or len(padded_res) == 0:
+        return det_res
+
+    restored = np.asarray(padded_res, dtype=np.float32).copy()
+    restored[..., 0] = np.clip(restored[..., 0] - padding, 0, max(0, width - 1))
+    restored[..., 1] = np.clip(restored[..., 1] - padding, 0, max(0, height - 1))
+    logger.debug(
+        f'table OCR-det recovered {len(restored)} box(es) with {padding}px edge padding '
+        f'for image shape {det_image.shape}'
+    )
+    return restored.tolist()
+
+
 def _process_single_table(
         table_res_dict: Dict,
         page_dict: Dict,
@@ -251,10 +345,14 @@ def _process_single_table(
     table_force_ocr = table_config.get("force_ocr", False)
     skip_text_in_image = table_config.get("skip_text_in_image", True)
     use_img2table = table_config.get("use_img2table", False)
-    table_use_word_box = table_config.get("use_word_box", True)
+    table_use_word_box = table_config.get("use_word_box", False)
     table_formula_enable = table_config.get("table_formula_enable", True)
     table_image_enable = table_config.get("table_image_enable", True)
     table_extract_original_image = table_config.get("extract_original_image", False)
+    use_rule_table = table_config.get("use_rule_table", True)
+    rule_table_score_threshold = float(table_config.get("rule_table_score_threshold", 0.90))
+    ocr_det_retry_padding = int(table_config.get("ocr_det_retry_padding", 8))
+    ocr_det_retry_short_side = int(table_config.get("ocr_det_retry_short_side", 32))
 
 
     _lang = table_res_dict['lang']
@@ -266,6 +364,55 @@ def _process_single_table(
             table_res_dict['single_page_mfdetrec_res'] + table_res_dict['checkbox_res'],
             useful_list, return_text=True
         )
+
+    # Resolve the configured model route before OCR. For combined models this
+    # classification is cached and reused if the native rule result falls
+    # back, avoiding the former second classification.
+    table_model = atom_model_manager.get_atom_model(
+        atom_model_name='table', lang=_lang, ocr_config=ocr_config,
+        table_config=table_config,
+    )
+    table_class = None
+    table_class_score = 1.0
+    pdf_not_rotate = page_dict.get("rotate_label") not in ["90", "180", "270"]
+    native_rule_candidate = (
+        use_rule_table
+        and not table_force_ocr
+        and not table_res_dict['ocr_enable']
+        and pdf_not_rotate
+        and hasattr(table_model, 'rule_table_class')
+    )
+    if native_rule_candidate:
+        try:
+            table_class, table_class_score = table_model.rule_table_class(table_res_dict['table_img'])
+            if table_class == "wired":
+                poly = table_res_dict['table_res']['poly']
+                table_bbox = [poly[0] / scale, poly[1] / scale, poly[4] / scale, poly[5] / scale]
+                table_bbox_scaled = [poly[0], poly[1], poly[4], poly[5]]
+                has_embedded_formula = any(
+                    item.get('bbox') and _box_center_in(table_bbox_scaled, item['bbox'])
+                    for item in table_res_dict['single_page_mfdetrec_res'] + table_res_dict['checkbox_res']
+                )
+                # Native images make cell semantics ambiguous. Skip even when
+                # table_image_enable is disabled, since this is a rule-parser
+                # safety decision rather than an output feature switch.
+                has_native_image = any(
+                    img.get('bbox') and _boxes_overlap(table_bbox, img['bbox'])
+                    for img in page_dict.get('ori_image_list', [])
+                )
+                if not has_native_image and not has_embedded_formula:
+                    rule_result = (
+                        build_rule_table(page_dict, table_bbox)
+                        or build_track_table(page_dict, table_bbox)
+                    )
+                    if rule_result and rule_result.score >= rule_table_score_threshold:
+                        table_res_dict['table_res'].pop('layout_image_list', None)
+                        table_res_dict['table_res']['html'] = rule_result.html
+                        table_res_dict['table_res']['rule_table_score'] = rule_result.score
+                        table_res_dict['table_res']['table_parse_method'] = 'pdfium_rule'
+                        return
+        except Exception as exc:
+            logger.warning(f'PDFium rule table failed, fallback to model: {exc}')
 
     ocr_config_clean = None
     if ocr_config is not None:
@@ -280,18 +427,53 @@ def _process_single_table(
         enable_merge_det_boxes=False,
     )
 
-    # 检测文字旋转
-    most_angle = txt_most_angle_extract_table(page_dict, table_res_dict, scale=scale)
-    if most_angle in [90, 270]:
-        rotate_image(table_res_dict, most_angle)
-
+    # 获取表格文本框
     bgr_image = cv2.cvtColor(table_res_dict["table_img"], cv2.COLOR_RGB2BGR)
-    det_res = ocr_model.ocr(bgr_image, mfd_res=adjusted_mfdetrec_res, rec=False)[0]
+    det_image = (
+        _apply_mask_boxes_to_image(bgr_image, adjusted_mfdetrec_res)
+        if adjusted_mfdetrec_res
+        else bgr_image
+    )
+    det_res = _detect_table_text(
+        ocr_model,
+        det_image,
+        adjusted_mfdetrec_res,
+        retry_padding=ocr_det_retry_padding,
+        retry_short_side=ocr_det_retry_short_side,
+    )
+
+    angles = []
+    rotate_label = "0"
+    if pdf_not_rotate:
+        # 检测文字旋转
+        rotate_label, angles = txt_most_angle_extract_table(page_dict, table_res_dict, scale=scale)
+    if not angles:
+        # 如果没有文本的角度，使用模型判断是否旋转
+        img_orientation_cls_model = atom_model_manager.get_atom_model(
+            atom_model_name=AtomicModel.ImgOrientationCls,
+        )
+        rotate_label = img_orientation_cls_model.predict(bgr_image, det_res)
+    if rotate_label in ["90", "270"]:
+        rotate_table_image(table_res_dict, rotate_label)
+        # 旋转后的表格需要重新获取文本框
+        bgr_image = cv2.cvtColor(table_res_dict["table_img"], cv2.COLOR_RGB2BGR)
+        det_image = (
+            _apply_mask_boxes_to_image(bgr_image, adjusted_mfdetrec_res)
+            if adjusted_mfdetrec_res
+            else bgr_image
+        )
+        det_res = _detect_table_text(
+            ocr_model,
+            det_image,
+            adjusted_mfdetrec_res,
+            retry_padding=ocr_det_retry_padding,
+            retry_short_side=ocr_det_retry_short_side,
+        )
 
     ocr_result = []
 
     # 尝试从 PDF 提取文本
-    if not table_force_ocr and not table_res_dict['ocr_enable'] and most_angle == 0:
+    if (not table_force_ocr and not table_res_dict['ocr_enable'] and rotate_label == "0" and pdf_not_rotate):
         ocr_result = _extract_table_text_from_pdf(
             table_res_dict, page_dict, scale, det_res, useful_list, table_use_word_box
         )
@@ -300,26 +482,27 @@ def _process_single_table(
     if not ocr_result and det_res:
         ocr_result = _run_table_ocr(ocr_model, bgr_image, det_res, table_use_word_box)
 
-    # 表格识别
-    table_model = atom_model_manager.get_atom_model(
-        atom_model_name='table',
-        lang=_lang,
-        ocr_config=ocr_config,
-        table_config=table_config,
-    )
-
     fill_image_res = []
     if table_image_enable:
+        if not pdf_not_rotate:
+            table_extract_original_image = False
         fill_image_res = extract_table_fill_image(
             page_dict, table_res_dict, scale, table_extract_original_image
         )
 
     table_res_dict['table_res'].pop('layout_image_list', None)
 
+    predict_kwargs = {'skip_table_orientation': True}
+    if hasattr(table_model, 'rule_table_class'):
+        predict_kwargs.update(
+            table_class=table_class,
+            table_class_score=table_class_score,
+        )
     html_code = table_model.predict(
         table_res_dict['table_img'], ocr_result,
         fill_image_res, adjusted_mfdetrec_res,
-        skip_text_in_image, use_img2table
+        skip_text_in_image, use_img2table,
+        **predict_kwargs,
     )
 
     if html_code and '<table>' in html_code and '</table>' in html_code:
@@ -344,6 +527,15 @@ def _process_single_table(
             ]
     else:
         logger.warning('table recognition processing fails')
+
+
+def _boxes_overlap(a, b) -> bool:
+    return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
+
+
+def _box_center_in(container, item) -> bool:
+    cx, cy = (item[0] + item[2]) / 2, (item[1] + item[3]) / 2
+    return container[0] <= cx <= container[2] and container[1] <= cy <= container[3]
 
 def _extract_table_text_from_pdf(
         table_res_dict: Dict,
@@ -374,7 +566,7 @@ def _extract_table_text_from_pdf(
 
         if table_use_word_box:
             filtered = [
-                (w[2], w[0], w[1])
+                (w[2], normalize_table_ocr_text(w[0]), w[1])
                 for item in ocr_spans
                 for group in [item.get('word_result')]
                 if group
@@ -383,7 +575,7 @@ def _extract_table_text_from_pdf(
             ]
         else:
             filtered = [
-                [item['ori_bbox'], item['content'], item['score']]
+                [item['ori_bbox'], normalize_table_ocr_text(item['content']), item['score']]
                 for item in ocr_spans if item.get('content')
             ]
 
@@ -407,19 +599,52 @@ def _run_table_ocr(
         })
 
     cropped_img_list = [item["cropped_img"] for item in rec_img_list]
-    ocr_res_list = ocr_model.ocr(
-        cropped_img_list, det=False, tqdm_enable=False,
-        return_word_box=table_use_word_box, ori_img=bgr_image, dt_boxes=det_res
-    )[0]
+    ocr_res_list = None
+    try:
+        ocr_res_list = ocr_model.ocr(
+            cropped_img_list, det=False, tqdm_enable=False,
+            return_word_box=table_use_word_box, ori_img=bgr_image, dt_boxes=det_res
+        )[0]
+    except Exception as exc:
+        if table_use_word_box:
+            logger.warning(f'table OCR word-box recognition failed, retry line-level OCR: {exc}')
+            table_use_word_box = False
+            try:
+                ocr_res_list = ocr_model.ocr(
+                    cropped_img_list, det=False, tqdm_enable=False,
+                    return_word_box=False, ori_img=bgr_image, dt_boxes=det_res
+                )[0]
+            except Exception as retry_exc:
+                logger.warning(f'table OCR batch recognition failed, retry one by one: {retry_exc}')
+        else:
+            logger.warning(f'table OCR batch recognition failed, retry one by one: {exc}')
+
+    if ocr_res_list is None:
+        ocr_res_list = []
+        rec_img_list_safe = []
+        for img_dict in rec_img_list:
+            try:
+                one_res = ocr_model.ocr(
+                    [img_dict["cropped_img"]], det=False, tqdm_enable=False,
+                    return_word_box=False, ori_img=bgr_image, dt_boxes=[img_dict["dt_box"]]
+                )[0]
+            except Exception as exc:
+                logger.warning(f'skip failed table OCR crop: {exc}')
+                continue
+            if not one_res:
+                continue
+            ocr_res_list.append(one_res[0])
+            rec_img_list_safe.append(img_dict)
+        rec_img_list = rec_img_list_safe
 
     ocr_result = []
     for img_dict, ocr_res in zip(rec_img_list, ocr_res_list):
         if table_use_word_box:
             ocr_result.extend([
-                [word_result[2], word_result[0], word_result[1]]
+                [word_result[2], normalize_table_ocr_text(word_result[0]), word_result[1]]
                 for word_result in ocr_res[2]
             ])
         else:
-            ocr_result.append([img_dict["dt_box"], ocr_res[0], ocr_res[1]])
+            ocr_result.append([img_dict["dt_box"], normalize_table_ocr_text(ocr_res[0]), ocr_res[1]])
 
     return [list(x) for x in zip(*ocr_result)] if ocr_result else []

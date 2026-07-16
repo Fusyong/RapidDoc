@@ -1,9 +1,13 @@
 import logging
 import traceback
+import cv2
 import numpy as np
 from typing import List, Dict, Any
+from loguru import logger
 from .main import TSRUnetStructurer
 from .table_recover import TableRecover
+from rapid_doc.model.table.utils import normalize_table_ocr_text
+from rapid_doc.utils.span_pre_proc import calculate_contrast
 from .utils.utils_table_recover import (
     match_ocr_cell,
     plot_html_table,
@@ -12,11 +16,27 @@ from .utils.utils_table_recover import (
     gather_ocr_list_by_row,
 )
 
+BLANK_CELL_REC_DROP_TEXTS = {
+    "1",
+    "一",
+    "—",
+    "口",
+    "■",
+    "（204号",
+    "（20",
+    "（2",
+    "（2号",
+    "（20号",
+    "号",
+    "（204",
+}
+
 class UnetTableRecognition:
     def __init__(self, cfg: Dict):
         self.cfg = cfg
         self.table_structure = TSRUnetStructurer(self.cfg)
         self.table_recover = TableRecover()
+        self.ocr_engine = None
 
     def __call__(
         self, ori_imgs: List[np.ndarray], ocr_results,
@@ -69,13 +89,14 @@ class UnetTableRecognition:
                 t_rec_ocr_list = self.transform_res(cell_box_det_map, polygons, logi_points)
                 # 将每个单元格中的ocr识别结果排序和同行合并，输出的html能完整保留文字的换行格式
                 t_rec_ocr_list = self.sort_and_gather_ocr_res(t_rec_ocr_list)
-                # cell_box_map =
-                logi_points = [t_box_ocr["t_logic_box"] for t_box_ocr in t_rec_ocr_list]
+
                 cell_box_det_map = {
-                    i: [ocr_box_and_text[1] for ocr_box_and_text in t_box_ocr["t_ocr_res"]]
-                    for i, t_box_ocr in enumerate(t_rec_ocr_list)
+                    t_box_ocr["cell_idx"]: [
+                        ocr_box_and_text[1] for ocr_box_and_text in t_box_ocr["t_ocr_res"]
+                    ]
+                    for t_box_ocr in t_rec_ocr_list
                 }
-                pred_html = plot_html_table(logi_points, cell_box_det_map)
+                pred_html = plot_html_table(logi_points, cell_box_det_map, polygons)
                 polygons = np.array(polygons).reshape(-1, 8)
                 logi_points = np.array(logi_points)
 
@@ -107,6 +128,8 @@ class UnetTableRecognition:
             xmax = max([ocr_box[0][2][0] for ocr_box in ocr_res_list])
             ymax = max([ocr_box[0][2][1] for ocr_box in ocr_res_list])
             dict_res = {
+                # 物理 cell 的原始下标，用于按完整结构回填空单元格
+                "cell_idx": i,
                 # xmin,xmax,ymin,ymax
                 "t_box": [xmin, ymin, xmax, ymax],
                 # row_start,row_end,col_start,col_end
@@ -138,10 +161,73 @@ class UnetTableRecognition:
         cell_box_map: Dict[int, List[str]],
     ) -> Dict[int, List[Any]]:
         """找到poly对应为空的框，尝试将直接将poly框直接送到识别中"""
+        if self.ocr_engine is None:
+            for i in range(sorted_polygons.shape[0]):
+                if not cell_box_map.get(i):
+                    cell_box_map[i] = [[sorted_polygons[i], "", 1]]
+            return cell_box_map
+
+        bgr_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        img_crop_info_list = []
+        img_crop_list = []
         for i in range(sorted_polygons.shape[0]):
             if cell_box_map.get(i):
                 continue
             box = sorted_polygons[i]
-            cell_box_map[i] = [[box, "", 1]]
-            continue
+            x1, y1 = int(box[0][0]) + 1, int(box[0][1]) + 1
+            x2, y2 = int(box[2][0]) - 1, int(box[2][1]) - 1
+            if x1 >= x2 or y1 >= y2 or x1 < 0 or y1 < 0:
+                cell_box_map[i] = [[box, "", 1]]
+                continue
+            if (x2 - x1) / max(y2 - y1, 1) > 20 or (y2 - y1) / max(x2 - x1, 1) > 20:
+                cell_box_map[i] = [[box, "", 1]]
+                continue
+
+            img_crop = bgr_img[y1:y2, x1:x2]
+            if calculate_contrast(img_crop, img_mode='bgr') <= 0.17:
+                cell_box_map[i] = [[box, "", 0.1]]
+                continue
+
+            img_crop_list.append(img_crop)
+            img_crop_info_list.append((i, box))
+
+        if not img_crop_list:
+            return cell_box_map
+
+        try:
+            ocr_result = self.ocr_engine.ocr(img_crop_list, det=False)
+        except Exception as exc:
+            logger.warning(f"Blank table cell OCR-rec failed: {exc}")
+            for i, box in img_crop_info_list:
+                cell_box_map.setdefault(i, [[box, "", 1]])
+            return cell_box_map
+
+        if not ocr_result or not isinstance(ocr_result, list) or len(ocr_result) == 0:
+            for i, box in img_crop_info_list:
+                cell_box_map.setdefault(i, [[box, "", 1]])
+            return cell_box_map
+
+        ocr_res_list = ocr_result[0]
+        if not isinstance(ocr_res_list, list) or len(ocr_res_list) != len(img_crop_list):
+            for i, box in img_crop_info_list:
+                cell_box_map.setdefault(i, [[box, "", 1]])
+            return cell_box_map
+
+        for (i, box), ocr_res in zip(img_crop_info_list, ocr_res_list):
+            ocr_text, ocr_score = ocr_res
+            if self._should_drop_blank_cell_rec_result(ocr_text, ocr_score):
+                cell_box_map[i] = [[box, "", 0.1]]
+                continue
+            cell_box_map[i] = [[box, normalize_table_ocr_text(ocr_text), ocr_score]]
         return cell_box_map
+
+    @staticmethod
+    def _should_drop_blank_cell_rec_result(text: str, score) -> bool:
+        try:
+            if float(score) < 0.6:
+                return True
+        except (TypeError, ValueError):
+            return True
+
+        normalized_text = "" if text is None else str(text).strip()
+        return not normalized_text or normalized_text in BLANK_CELL_REC_DROP_TEXTS

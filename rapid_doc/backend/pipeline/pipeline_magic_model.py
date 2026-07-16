@@ -312,6 +312,10 @@ class MagicModel:
         )
         
         return inline_equations, interline_equations, interline_equation_blocks
+
+    def get_formula_numbers(self) -> List[Dict]:
+        """获取公式编号区块"""
+        return self.__get_blocks_by_type(CategoryId.InterlineEquationNumber_Layout)
     
     def get_discarded(self) -> List[Dict]:
         """获取废弃区块"""
@@ -363,6 +367,8 @@ class MagicModel:
             
             if category_id == CategoryId.ImageBody:
                 span['type'] = ContentType.IMAGE
+                if 'seal' == layout_det.get("original_label"):
+                    span['content'] = layout_det.get('text')
             elif category_id == CategoryId.TableBody:
                 latex = layout_det.get('latex')
                 html = layout_det.get('html')

@@ -2,6 +2,8 @@
 """
 批量分析模块
 """
+import os
+import inspect
 from typing import List, Tuple, Dict, Optional
 
 import cv2
@@ -12,12 +14,16 @@ from tqdm import tqdm
 
 from .analyze_utils import _extract_text_from_pdf, _run_ocr_det_batch, _process_single_table, _run_ocr_rec_postprocess
 from .model_init import AtomModelSingleton
-from ..utils import remove_layout_in_ori_images, filter_overlap_boxes
+from .model_list import AtomicModel
+from ..utils.utils import remove_layout_in_ori_images, filter_overlap_boxes, _expand_formula_crop_res
 from ...model.custom import CustomBaseModel
+from ...utils.bbox_utils import normalize_to_int_bbox
+from ...utils.boxbase import get_rotate_image, restore_poly
 from ...utils.checkbox_det_cls import checkbox_predict
 from ...utils.config_reader import get_formula_enable, get_table_enable
 from ...utils.enum_class import CategoryId
 from ...utils.model_utils import crop_img, get_res_list_from_layout_res, clean_vram
+from ...utils.pdf_image_tools import get_crop_np_img
 from ...utils.span_pre_proc import extract_table_fill_image
 
 
@@ -53,21 +59,19 @@ class BatchAnalyze:
         # OCR 配置
         self.use_det_mode = self.ocr_config.get("use_det_mode", "auto")
         self.ocr_det_base_batch_size = self.ocr_config.get("Det.rec_batch_num", 1)
+        self.seal_enable = self.ocr_config.get("seal_enable", True)
         self.use_custom_ocr = False
         
         # 版面配置
         self.layout_base_batch_size = self.layout_config.get("batch_num", 1)
-        
+        self.use_doc_orientation_classify = (str(os.getenv("USE_DOC_ORIENTATION_CLASSIFY", "false"))
+                                             .strip().lower() in ("true", "1", "yes", "on"))
         # 公式配置
         self.formula_level = self.formula_config.get("formula_level", 0)
         self.formula_base_batch_size = self.formula_config.get("batch_num", 1)
+        self.formula_bbox_expand_px = int(self.formula_config.get("bbox_expand_px", 2))
         
         # 表格配置
-        self.table_force_ocr = self.table_config.get("force_ocr", False)
-        self.skip_text_in_image = self.table_config.get("skip_text_in_image", True)
-        self.use_img2table = self.table_config.get("use_img2table", False)
-        self.table_use_word_box = self.table_config.get("use_word_box", True)
-        self.table_formula_enable = self.table_config.get("table_formula_enable", True)
         self.table_image_enable = self.table_config.get("table_image_enable", True)
         self.table_extract_original_image = self.table_config.get("extract_original_image", False)
     
@@ -97,13 +101,29 @@ class BatchAnalyze:
             formula_config=self.formula_config,
             table_config=self.table_config,
         )
+        atom_model_manager = AtomModelSingleton()
         self.use_custom_ocr = isinstance(self.model.ocr_model, CustomBaseModel)
         
         # 预处理数据
         pdf_dict_list = [pdf_dict for _, _, _, _, pdf_dict in images_with_extra_info]
-        np_images = [cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR) for image, _, _, _, _ in images_with_extra_info]
+        # np_images = [cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR) for image, _, _, _, _ in images_with_extra_info]
+        np_images = [np.array(image) for image, _, _, _, _ in images_with_extra_info]
         scale_list = [scale for _, scale, _, _, _ in images_with_extra_info]
-        
+
+        # 图片方向矫正
+        img_ori_orientation_list = []
+        if self.use_doc_orientation_classify:
+            img_orientation_cls_model = atom_model_manager.get_atom_model(
+                atom_model_name=AtomicModel.ImgOrientationCls,
+            )
+            for i, np_img in enumerate(np_images):
+                h, w = np_img.shape[:2]
+                rotate_label = img_orientation_cls_model.predict(np_img)
+                if rotate_label in ["90", "270"]:
+                    np_images[i] = get_rotate_image(np_img, rotate_label)
+                pdf_dict_list[i]['rotate_label'] = rotate_label
+                img_ori_orientation_list.append((h, w, rotate_label))
+
         # 1. 版面识别
         images_layout_res = self._run_layout_detection(np_images, pdf_dict_list, scale_list)
         # 2. 收集各类型检测区域
@@ -118,13 +138,27 @@ class BatchAnalyze:
             self._run_custom_ocr(ocr_res_all_page)
         else:
             self._run_traditional_ocr(
-                ocr_res_all_page, pdf_dict_list, scale_list
+                atom_model_manager, ocr_res_all_page, pdf_dict_list, scale_list
             )
         # 5. 表格识别
         if self.table_enable:
-            self._run_table_recognition(table_res_all_page, pdf_dict_list, scale_list)
+            self._run_table_recognition(atom_model_manager, table_res_all_page, pdf_dict_list, scale_list)
         # 6. 后处理 OCR rec 结果
         _run_ocr_rec_postprocess(images_layout_res, self.ocr_config)
+
+        # 7. 印章识别
+        if self.seal_enable:
+            self._run_seal_ocr(atom_model_manager, np_images, images_layout_res)
+
+        if img_ori_orientation_list:
+            # 把旋转后图片上的矩形框，还原到原图坐标
+            for index, np_img in enumerate(np_images):
+                h, w, rotate_label = img_ori_orientation_list[index]
+                layout_res = images_layout_res[index]
+                for layout_re in layout_res:
+                    layout_re["rotate_label"] = rotate_label
+                    if rotate_label in ["90", "270"]:
+                        layout_re["poly"] = restore_poly(layout_re["poly"], rotate_label, w, h)
 
         clean_vram(self.model.device, vram_threshold=8)
         return images_layout_res
@@ -144,8 +178,8 @@ class BatchAnalyze:
         if self.use_det_mode == 'txt':
             images_layout_res = remove_layout_in_ori_images(images_layout_res, pdf_dict_list, scale_list)
         
-        # 公式等级过滤
-        if self.formula_enable and self.formula_level == 1:
+        # 公式等级过滤（不识别行间公式，直接作为文本识别）
+        if not self.formula_enable or self.formula_level == 1:
             images_layout_res = [
                 [item for item in page if item["category_id"] != CategoryId.InlineEquation]
                 for page in images_layout_res
@@ -198,13 +232,22 @@ class BatchAnalyze:
 
             # 表格区域
             for table_res in table_res_list:
-                table_img, useful_list = crop_img(table_res, np_img)
-                rect_table_img, _ = crop_img(table_res, np_img, layout_shape_mode="rect")
+                def get_crop_table_img(scale):
+                    bbox = [table_res["poly"][0], table_res["poly"][1], table_res["poly"][4], table_res["poly"][5]]
+                    bbox = normalize_to_int_bbox(
+                        [float(v) / float(scale) for v in bbox]
+                    )
+                    if bbox is None:
+                        return np_img[0:0, 0:0]
+                    return get_crop_np_img(bbox, np_img, scale=scale, return_list=True)
+                table_img, useful_list = get_crop_table_img(scale=5)
+                # table_img, useful_list = crop_img(table_res, np_img)
+                # rect_table_img, _ = crop_img(table_res, np_img, layout_shape_mode="rect")
                 table_res_all_page.append({
                     'table_res': table_res,
                     'lang': _lang,
                     'table_img': table_img, #矩形框/异型框的表格
-                    'rect_table_img': rect_table_img, #矩形框的表格
+                    'rect_table_img': table_img, #矩形框的表格
                     'single_page_mfdetrec_res': formula_res_list,
                     'checkbox_res': checkbox_res,
                     'useful_list': useful_list,
@@ -214,7 +257,10 @@ class BatchAnalyze:
 
             # 公式区域
             for formula_res in formula_res_list:
-                formula_img, _ = crop_img(formula_res, np_img)
+                formula_crop_res = _expand_formula_crop_res(
+                    formula_res, layout_res, np_img.shape, self.formula_bbox_expand_px
+                )
+                formula_img, _ = crop_img(formula_crop_res, np_img)
                 formula_res_all_page.append({
                     'formula_res': formula_res,
                     'lang': _lang,
@@ -288,12 +334,12 @@ class BatchAnalyze:
 
     def _run_traditional_ocr(
         self,
+        atom_model_manager,
         ocr_res_all_page: List[Dict],
         pdf_dict_list: List[Dict],
         scale_list: List[float],
     ):
         """传统 OCR 处理流程 (det + rec)"""
-        atom_model_manager = AtomModelSingleton()
 
         # PDF 文本提取模式
         if self.use_det_mode != 'ocr':
@@ -304,6 +350,7 @@ class BatchAnalyze:
 
     def _run_table_recognition(
         self,
+        atom_model_manager,
         table_res_all_page: List[Dict],
         pdf_dict_list: List[Dict],
         scale_list: List[float]
@@ -334,17 +381,16 @@ class BatchAnalyze:
                         table_res_dict['table_res']['html'] = table_result
         else:
             # 传统模式表格识别
-            self._run_traditional_table_recognition(table_res_all_page, pdf_dict_list, scale_list)
+            self._run_traditional_table_recognition(atom_model_manager, table_res_all_page, pdf_dict_list, scale_list)
 
     def _run_traditional_table_recognition(
         self,
+        atom_model_manager,
         table_res_all_page: List[Dict],
         pdf_dict_list: List[Dict],
         scale_list: List[float]
     ):
         """传统表格识别处理"""
-        atom_model_manager = AtomModelSingleton()
-
         table_res_grouped = {}
         for x in table_res_all_page:
             table_res_grouped.setdefault(x["page_idx"], []).append(x)
@@ -365,3 +411,46 @@ class BatchAnalyze:
                     )
                     pbar.update(1)
 
+
+    def _run_seal_ocr(
+        self,
+        atom_model_manager,
+        np_images,
+        images_layout_res,
+    ):
+        """印章 处理流程"""
+        seal_ocr_items = []
+        for index, np_img in enumerate(np_images):
+            layout_res = images_layout_res[index]
+            for layout_re in layout_res:
+                if 'seal' == layout_re.get("original_label"):
+                    seal_img, _ = crop_img(layout_re, np_img)
+                    seal_crop_bgr = cv2.cvtColor(seal_img, cv2.COLOR_RGB2BGR)
+                    seal_ocr_items.append((seal_crop_bgr, layout_re))
+
+        seal_ocr_model = None
+        for seal_crop_bgr, layout_re in tqdm(seal_ocr_items, desc="Seal Predict"):
+            if (isinstance(self.model.ocr_model, CustomBaseModel)
+                    and 'is_seal' in inspect.signature(self.model.ocr_model.batch_predict).parameters):
+                seal_texts = self.model.ocr_model.batch_predict([seal_crop_bgr], is_seal=True)
+                seal_texts = seal_texts[0].split('\n')
+            else:
+                if seal_ocr_model is None:
+                    seal_ocr_model = atom_model_manager.get_atom_model(
+                        atom_model_name=AtomicModel.OCR,
+                        is_seal=True,
+                    )
+                seal_ocr_res = seal_ocr_model.ocr(seal_crop_bgr, det=True, rec=True)[0]
+                if not seal_ocr_res:
+                    continue
+                seal_texts = []
+                for seal_item in seal_ocr_res:
+                    if not seal_item or len(seal_item) != 2:
+                        continue
+                    rec_result = seal_item[1]
+                    if not rec_result or len(rec_result) < 1:
+                        continue
+                    rec_text = rec_result[0]
+                    if rec_text:
+                        seal_texts.append(rec_text)
+            layout_re["text"] = seal_texts

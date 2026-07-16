@@ -7,6 +7,7 @@ from ...model.custom import CustomBaseModel
 from ...model.layout.rapid_layout import RapidLayoutModel
 from ...model.formula.rapid_formula_model import RapidFormulaModel
 from ...model.ocr.rapid_ocr import RapidOcrModel
+from ...model.orientation.rapid_orientation_model import RapidOrientationModel
 from ...model.table.rapid_table import RapidTableModel
 from ...utils.hash_utils import make_hashable
 
@@ -27,6 +28,11 @@ def table_model_init(lang=None, ocr_config=None, table_config=None):
     table_model = RapidTableModel(ocr_engine, table_config)
     return table_model
 
+
+def img_orientation_cls_model_init():
+    cls_model = RapidOrientationModel()
+    return cls_model
+
 def formula_model_init(formula_config=None):
     model = RapidFormulaModel(formula_config)
     return model
@@ -36,14 +42,15 @@ def layout_model_init(layout_config=None):
     model = RapidLayoutModel(layout_config)
     return model
 
-def ocr_model_init(det_db_box_thresh=0.3, lang=None, ocr_config=None, det_db_unclip_ratio=1.8, enable_merge_det_boxes=True):
+def ocr_model_init(det_db_box_thresh=0.5, lang=None, ocr_config=None, det_db_unclip_ratio=1.8, enable_merge_det_boxes=True, is_seal=False):
     model = RapidOcrModel(
             det_db_box_thresh=det_db_box_thresh,
             lang=lang,
             ocr_config=ocr_config,
             use_dilation=True,
             det_db_unclip_ratio=det_db_unclip_ratio,
-            enable_merge_det_boxes=enable_merge_det_boxes,)
+            enable_merge_det_boxes=enable_merge_det_boxes,
+            is_seal=is_seal)
     return model
 
 
@@ -66,7 +73,8 @@ class AtomModelSingleton:
                 kwargs.get('det_db_box_thresh', 0.3),
                 kwargs.get('lang'),
                 kwargs.get('det_db_unclip_ratio', 1.8),
-                kwargs.get('enable_merge_det_boxes', True)
+                kwargs.get('enable_merge_det_boxes', True),
+                kwargs.get('is_seal', True),
             )
         elif atom_model_name in [AtomicModel.Table]:
             key = (atom_model_name, make_hashable(kwargs.get('table_config', None)))
@@ -99,7 +107,8 @@ def atom_model_init(model_name: str, **kwargs):
                 kwargs.get('lang'),
                 kwargs.get('ocr_config'),
                 kwargs.get('det_db_unclip_ratio', 1.8),
-                kwargs.get('enable_merge_det_boxes', True)
+                kwargs.get('enable_merge_det_boxes', True),
+                kwargs.get('is_seal', False),
             )
     elif model_name == AtomicModel.Table:
         atom_model = (kwargs.get('table_config') or {}).get('custom_model')
@@ -109,6 +118,8 @@ def atom_model_init(model_name: str, **kwargs):
                 kwargs.get('ocr_config'),
                 kwargs.get('table_config'),
             )
+    elif model_name == AtomicModel.ImgOrientationCls:
+        atom_model = img_orientation_cls_model_init()
     else:
         logger.error('model name not allow')
         exit(1)
@@ -153,7 +164,6 @@ class MineruPipelineModel:
         # 初始化ocr
         self.ocr_model = atom_model_manager.get_atom_model(
             atom_model_name=AtomicModel.OCR,
-            det_db_box_thresh=0.3,
             lang=self.lang,
             ocr_config=self.ocr_config,
         )

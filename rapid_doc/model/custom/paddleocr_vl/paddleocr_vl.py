@@ -31,7 +31,7 @@ class VLModelPool:
                         raise RuntimeError(
                             "PADDLEOCRVL_VERSION not set — VL OCR is disabled. "
                             "Please set environment variable PADDLEOCRVL_VERSION "
-                            "(e.g. v1 or v1.5)."
+                            "(e.g. v1 or v1.5 or v1.6)."
                         )
                     if not server_url:
                         raise RuntimeError(
@@ -50,10 +50,12 @@ class VLModelPool:
                         model_name = "PaddleOCR-VL-0.9B"
                     elif paddleocrvl_version == "v1.5":
                         model_name = "PaddleOCR-VL-1.5-0.9B"
+                    elif paddleocrvl_version == "v1.6":
+                        model_name = "PaddleOCR-VL-1.6-0.9B"
                     else:
                         raise ValueError(
                             f"environment PADDLEOCRVL_VERSION Unsupported: {paddleocrvl_version}. "
-                            "Supported versions: v1, v1.5"
+                            "Supported versions: v1, v1.5, v1.6"
                         )
                     cls._vl_model = DocVLMPredictor(
                         model_name=model_name,
@@ -65,11 +67,15 @@ class VLModelPool:
 
 class PaddleOCRVLOCRModel(CustomBaseModel):
 
-    def batch_predict(self, image_list: list, **kwargs) -> list[str]:
+    def batch_predict(self, image_list: list, is_seal=False, **kwargs) -> list[str]:
         result_res = []
         vl_rec_model = VLModelPool.get_vl_model()
+        if is_seal:
+            text_prompt = "Seal Recognition:"
+        else:
+            text_prompt = "OCR:"
         with tqdm(total=len(image_list), desc="OCR Predict") as pbar:
-            data = [{"image": img, "query": "OCR:"} for img in image_list]
+            data = [{"image": img, "query": text_prompt} for img in image_list]
             preds = vl_rec_model._genai_client_process(data)
 
             for result_str in preds:
@@ -165,3 +171,16 @@ class PaddleOCRVLTableModel(CustomBaseModel):
                 result_res.append(html_str)
             pbar.update(len(image_list))
         return result_res
+
+
+if __name__ == '__main__':
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    from pathlib import Path
+    rapid_doc_dir = Path(os.path.abspath(__file__)).parent.parent.parent.parent.parent
+    img_path = os.path.join(rapid_doc_dir, 'demo\\images', 'seal_text_det.png')
+
+    ocr_model = PaddleOCRVLOCRModel()
+    results = ocr_model.batch_predict([img_path], is_seal=True)
+    print(results)

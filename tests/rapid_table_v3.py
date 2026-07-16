@@ -24,27 +24,38 @@ default_params = {
 ocr_engine = RapidOCR(params=default_params)
 
 input_args = RapidTableInput(
-    model_type=ModelType.UNET,
-    engine_type=TableEngineType.OPENVINO
+    # model_type=ModelType.SLANET1M,
+    # engine_type=TableEngineType.OPENVINO
+    # model_dir_or_path=r"D:\CodeProjects\doc\RapidAI\models\table\slanet-1m.onnx"
+    # model_dir_or_path=r"D:\CodeProjects\doc\RapidAI\models\table\ch_ppstructure_mobile_v2_SLANet.onnx"
+
+    model_type= ModelType.SLANETPLUS,
+    # model_dir_or_path= r"D:\CodeProjects\doc\RapidAI\models\table\table2\model\inference.onnx"
 )
 
 table_engine = RapidTable(input_args)
 
 img_paths = [
-    "2a18af309c8ea0e9419ab8ea69d24868ef86288da9d7d57de6e19a769c2d2630.jpg",
+    r"D:\CodeProjects\doc\RapidAI\RapidDoc\demo\images\table_16.png",
+    # "img.png"
     ]
 ocr_results_list = []
-
+return_word_box = False
 for img in img_paths:
-    ori_ocr_res = ocr_engine(img, return_word_box=True)
-    ocr_results = [ori_ocr_res.boxes, ori_ocr_res.txts, ori_ocr_res.scores, ori_ocr_res.word_results]
-    ocr_result = []
-    for word_results in ori_ocr_res.word_results:
-        ocr_result.extend([[word_result[2], word_result[0], word_result[1]] for word_result in word_results])
-    ocr_result = [list(x) for x in zip(*ocr_result)]
-    ocr_results_list.append(ocr_result)
+    ori_ocr_res = ocr_engine(img, return_word_box=return_word_box)
+    if return_word_box:
+        ocr_results = [ori_ocr_res.boxes, ori_ocr_res.txts, ori_ocr_res.scores, ori_ocr_res.word_results]
+        ocr_result = []
+        for word_results in ori_ocr_res.word_results:
+            ocr_result.extend([[word_result[2], word_result[0], word_result[1]] for word_result in word_results])
+        ocr_result = [list(x) for x in zip(*ocr_result)]
+        ocr_results_list.append(ocr_result)
+
+    else:
+        ocr_results = [ori_ocr_res.boxes, ori_ocr_res.txts, ori_ocr_res.scores]
+        ocr_results_list.append(ocr_results)
 
 
 results = table_engine(img_paths, ocr_results=ocr_results_list, batch_size=4)
 
-results.vis(save_dir=r"outputs3", save_name="vis")
+results.vis(save_dir=r"outputs-1m113", save_name="vis")

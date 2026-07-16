@@ -1,17 +1,24 @@
-FROM python:3.10.16-slim
+FROM docker.1ms.run/library/python:3.10.16-slim
+
+ARG DEBIAN_FRONTEND=noninteractive
 
 # Install libgl for opencv support & Noto fonts for Chinese characters
-RUN apt-get update && \
-    apt-get install -y \
+RUN sed -i 's|http://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g; s|http://deb.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
         libglib2.0-0 \
         libsm6 \
         libxext6 \
         libxrender-dev \
+        libreoffice-writer \
+        libreoffice-calc \
+        libreoffice-impress \
         fonts-noto-core \
         fonts-noto-cjk \
         fontconfig \
         wget \
         curl \
+        ca-certificates \
         libgl1 && \
     fc-cache -fv && \
     apt-get clean && \
@@ -20,20 +27,27 @@ RUN apt-get update && \
 # 设置工作目录
 WORKDIR /app
 
+# 配置 pip 国内镜像与超时，降低大包下载超时概率
+ENV PIP_INDEX_URL=https://pypi.org/simple
+ENV PIP_DEFAULT_TIMEOUT=300
+ENV PIP_RETRIES=10
+
 # 安装 Python 依赖
-RUN python3 -m pip install 'rapid-doc[cpu]==0.7.0' -i https://pypi.org/simple --break-system-packages && \
-    python3 -m pip install 'rapid-doc[api]==0.7.0' -i https://pypi.org/simple --break-system-packages && \
+RUN python3 -m pip install --upgrade pip setuptools wheel --break-system-packages && \
+    python3 -m pip install --no-cache-dir --prefer-binary --break-system-packages \
+        --index-url https://pypi.org/simple \
+        'rapid-doc[cpu,api]==0.9.9' && \
     python3 -m pip cache purge
 
 # 复制配置文件和脚本（优先复制，利用Docker缓存）
-COPY .env.example /app/
-COPY start_with_env.sh /app/
+COPY docker/.env.example /app/
+COPY docker/start_with_env.sh /app/
 
 # 设置启动脚本权限
-RUN chmod +x  start_with_env.sh
+RUN sed -i 's/\r$//' /app/start_with_env.sh && chmod +x /app/start_with_env.sh
 
 # 复制应用代码（最后复制，避免频繁变更影响缓存）
-COPY app.py file_converter.py download_models.py models_download_utils.py /app/
+COPY docker/app.py docker/file_converter.py docker/download_file.py docker/download_models.py docker/models_download_utils.py /app/
 
 # 设置基础环境变量
 ENV PYTHONPATH=/app

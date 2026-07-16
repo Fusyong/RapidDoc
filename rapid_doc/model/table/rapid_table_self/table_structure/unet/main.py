@@ -19,7 +19,6 @@ from ...utils.typings import EngineType
 
 import copy
 import math
-from skimage import measure
 from .utils.utils import resize_img
 from .utils.utils_table_line_rec import (
     get_table_line,
@@ -27,6 +26,8 @@ from .utils.utils_table_line_rec import (
     min_area_rect_box,
     draw_lines,
     adjust_lines,
+    _iter_connected_component_coords,
+    min_area_rect_box_from_components,
 )
 from .utils.utils_table_recover import (
     sorted_ocr_boxes,
@@ -164,10 +165,9 @@ class TSRUnetStructurer:
         return polygons, rotated_polygons
 
     def cal_region_boxes(self, tmp):
-        labels = measure.label(tmp < 255, connectivity=2)  # 8连通区域标记
-        regions = measure.regionprops(labels)
-        ceilboxes = min_area_rect_box(
-            regions,
+        components = _iter_connected_component_coords(tmp < 255)  # 8连通区域标记
+        ceilboxes = min_area_rect_box_from_components(
+            components,
             False,
             tmp.shape[1],
             tmp.shape[0],
@@ -209,6 +209,13 @@ class TSRUnetStructurer:
     def unrotate_polygons(
         self, polygons: np.ndarray, angle: float, img_shape: tuple
     ) -> np.ndarray:
+        if polygons is None:
+            return np.empty((0, 4, 2), dtype=np.float32)
+
+        polygons = np.asarray(polygons, dtype=np.float32)
+        if polygons.size == 0:
+            return np.empty((0, 4, 2), dtype=np.float32)
+
         # 将多边形旋转回原始位置
         (h, w) = img_shape
         center = (w // 2, h // 2)
@@ -219,6 +226,8 @@ class TSRUnetStructurer:
 
         # 批量逆旋转
         unrotated_polygons = cv2.transform(polygons_reshaped, M_inv)
+        if unrotated_polygons is None:
+            return np.empty((0, 4, 2), dtype=np.float32)
 
         # 将 (N, 4, 2) 转换回 (N, 8)
         unrotated_polygons = unrotated_polygons.reshape(-1, 8)
