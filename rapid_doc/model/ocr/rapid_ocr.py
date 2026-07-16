@@ -119,6 +119,11 @@ class RapidOcrModel(object):
             if not default_params.get("Rec.model_path"):
                 v6_rec_small_path = os.path.join(rapid_doc_dir, 'resources', 'PP-OCRv6_rec_small.onnx')
                 default_params["Rec.model_path"] = v6_rec_small_path
+            # OpenVINO 无法从 ONNX metadata 读取 character 表，必须显式指定 v6 字典；
+            # 否则会按 OCRVersion.PPOCRV5 回退到 ppocrv5_dict，导致高置信度乱码。
+            if not default_params.get("Rec.rec_keys_path"):
+                v6_dict_path = os.path.join(rapid_doc_dir, 'resources', 'ppocrv6_dict.txt')
+                default_params["Rec.rec_keys_path"] = v6_dict_path
         # elif default_params["Det.engine_type"] in [EngineType.TORCH]:
         #     if not default_params.get("Det.model_path"):
         #         v6_det_small_path = os.path.join(rapid_doc_dir, 'resources', 'PP-OCRv6_det_small.safetensors')
@@ -150,14 +155,18 @@ class RapidOcrModel(object):
 
             seal_det_model_path = os.path.join(rapid_doc_dir, 'resources', 'pp-ocrv4_mobile_seal_det.onnx')
             default_params['Det.model_path'] = seal_det_model_path
+            v6_dict_path = os.path.join(rapid_doc_dir, 'resources', 'ppocrv6_dict.txt')
             if default_params["Rec.engine_type"] in [EngineType.ONNXRUNTIME, EngineType.OPENVINO]:
                 v6_rec_small_path = os.path.join(rapid_doc_dir, 'resources', 'PP-OCRv6_rec_small.onnx')
                 default_params["Rec.model_path"] = v6_rec_small_path
+                # 印章 rec 也用 v6：OpenVINO 同样需要显式字典
+                if not default_params.get("Rec.rec_keys_path"):
+                    default_params["Rec.rec_keys_path"] = v6_dict_path
             elif default_params["Rec.engine_type"] == EngineType.TORCH:
                 v6_rec_small_path = os.path.join(rapid_doc_dir, 'resources', 'PP-OCRv6_rec_small.safetensors')
                 default_params["Rec.model_path"] = v6_rec_small_path
-                v6_dict_path = os.path.join(rapid_doc_dir, 'resources', 'ppocrv6_dict.txt')
-                default_params["Rec.rec_keys_path"] = v6_dict_path
+                if not default_params.get("Rec.rec_keys_path"):
+                    default_params["Rec.rec_keys_path"] = v6_dict_path
             self.enable_merge_det_boxes = False
 
         self.ocr_engine = RapidOCR(params=default_params)
