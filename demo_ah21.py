@@ -32,7 +32,16 @@ from rapid_doc.utils.enum_class import MakeMode
 from rapid_doc.utils.config_reader import get_processing_window_size
 from rapid_doc.utils.guess_suffix_or_lang import guess_suffix_by_bytes, guess_suffix_by_path
 from rapid_doc.utils.office_converter import convert_legacy_office_to_modern
-from rapid_doc.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2, prepare_env, read_fn, office_suffixes, old_office_suffixes
+from rapid_doc.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2, read_fn, office_suffixes, old_office_suffixes
+
+
+def prepare_env(output_dir, pdf_file_name, parse_method=None):
+    """创建输出目录：output_dir/pdf_file_name（不再按 parse_method 分子目录）。"""
+    local_md_dir = str(os.path.join(output_dir, pdf_file_name))
+    local_image_dir = os.path.join(local_md_dir, "images")
+    os.makedirs(local_image_dir, exist_ok=True)
+    os.makedirs(local_md_dir, exist_ok=True)
+    return local_image_dir, local_md_dir
 from rapid_doc.backend.office.office_analyze import office_analyze
 from rapid_doc.backend.office.office_middle_json_mkcontent import union_make as office_union_make
 from rapid_doc.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
@@ -64,10 +73,10 @@ def do_parse(
     f_draw_span_bbox=True,  # Whether to draw span bounding boxes
     f_create_layered_pdf=True,  # Whether to create layered PDF (ah21)
     f_dump_md=True,  # Whether to dump markdown files
-    f_dump_middle_json=True,  # Whether to dump middle JSON files
-    f_dump_model_output=True,  # Whether to dump model output files
-    f_dump_orig_pdf=True,  # Whether to dump original PDF files
-    f_dump_content_list=True,  # Whether to dump content list files
+    f_dump_middle_json=False,  # Whether to dump middle JSON files
+    f_dump_model_output=False,  # Whether to dump model output files
+    f_dump_orig_pdf=False,  # Whether to dump original PDF files
+    f_dump_content_list=False,  # Whether to dump content list files
     f_dump_md_html=False,  # Whether to convert markdown to HTML
     f_dump_md_docx=False,  # Whether to convert markdown to docx (via Pandoc)
     f_make_md_mode=MakeMode.MM_MD,  # The mode for making markdown content, default is MM_MD
@@ -357,10 +366,10 @@ def _process_office_doc(
         pdf_file_names: list[str],
         pdf_bytes_list: list[bytes],
         f_dump_md=True,
-        f_dump_middle_json=True,
-        f_dump_model_output=True,
-        f_dump_orig_file=True,
-        f_dump_content_list=True,
+        f_dump_middle_json=False,
+        f_dump_model_output=False,
+        f_dump_orig_file=False,
+        f_dump_content_list=False,
         f_make_md_mode=MakeMode.MM_MD,
         f_dump_md_html=False,
         f_dump_md_docx=False,
@@ -373,7 +382,7 @@ def _process_office_doc(
 
             need_remove_index.append(i)
 
-            local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, f"office")
+            local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name)
             image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
             middle_json, infer_result = office_analyze(
                 file_bytes,
@@ -517,13 +526,12 @@ def _process_output(
             f"{pdf_file_name}_content_list.json",
             json.dumps(content_list, ensure_ascii=False, indent=4),
         )
-
-    if process_mode != "pipeline":
-        content_list_v2 = make_func(pdf_info, MakeMode.CONTENT_LIST_V2, image_dir)
-        md_writer.write_string(
-            f"{pdf_file_name}_content_list_v2.json",
-            json.dumps(content_list_v2, ensure_ascii=False, indent=4),
-        )
+        if process_mode != "pipeline":
+            content_list_v2 = make_func(pdf_info, MakeMode.CONTENT_LIST_V2, image_dir)
+            md_writer.write_string(
+                f"{pdf_file_name}_content_list_v2.json",
+                json.dumps(content_list_v2, ensure_ascii=False, indent=4),
+            )
 
     if f_dump_middle_json:
         md_writer.write_string(
@@ -588,9 +596,6 @@ def parse_doc(
 
 
 if __name__ == '__main__':
-    __dir__ = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(__dir__, "output")
-
     doc_path_list = [
 r"E:\语文出版社\2026\小古文项目\图书\最终整理\走进小古文阅读与训练\走进小古文阅读与训练-h.pdf",
 # r"E:\语文出版社\2026\小古文项目\图书\最终整理\走进小古文文言文字词句入门\走进小古文文言文字词句入门-h.pdf",
@@ -661,5 +666,8 @@ r"E:\语文出版社\2026\小古文项目\图书\最终整理\走进小古文阅
         METHOD = "auto"
         # 语言：ch chinese_cht en korean japan ta te ka
         LANG = None
-        parse_doc([Path(doc_path)], output_dir, method=METHOD, lang=LANG)
+        doc_path = Path(doc_path)
+        # 默认输出到 PDF 同目录下的同名文件夹
+        output_dir = str(doc_path.parent)
+        parse_doc([doc_path], output_dir, method=METHOD, lang=LANG)
         print(f"总运行时间: {time.time() - start_time}秒")

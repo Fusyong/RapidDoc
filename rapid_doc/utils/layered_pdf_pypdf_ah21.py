@@ -212,8 +212,19 @@ def create_layered_pdf_pypdf(
                 break
 
             original_page = pdf_reader.pages[page_idx]
-            page_width = float(original_page.cropbox[2])
-            page_height = float(original_page.cropbox[3])
+            # 将 /Rotate 烘焙进内容流并清零 Rotate。否则 OCR 得到的是“正向”
+            # 图像坐标，而文字层仍按未旋转用户空间 LTR 写入；页面带 Rotate=180
+            # 时，阅读器再旋转一次会导致同行文字左右颠倒（复制顺序仍正确）。
+            try:
+                page_rotate = int(original_page.get("/Rotate", 0) or 0) % 360
+            except (ValueError, TypeError):
+                page_rotate = 0
+            if page_rotate:
+                original_page.transfer_rotation_to_content()
+
+            crop = original_page.cropbox
+            page_width = float(crop[2]) - float(crop[0])
+            page_height = float(crop[3]) - float(crop[1])
 
             packet = BytesIO()
             c = canvas.Canvas(packet, pagesize=(page_width, page_height))
