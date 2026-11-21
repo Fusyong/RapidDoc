@@ -42,6 +42,35 @@ def prepare_env(output_dir, pdf_file_name, parse_method=None):
     os.makedirs(local_image_dir, exist_ok=True)
     os.makedirs(local_md_dir, exist_ok=True)
     return local_image_dir, local_md_dir
+
+
+def _resolve_cjk_font_path() -> str | None:
+    """CJK 字体：AH21_CJK_FONT → 常见系统字体 → None。"""
+    env_font = os.getenv("AH21_CJK_FONT", "").strip()
+    if env_font and os.path.isfile(env_font):
+        return env_font
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    candidates = [
+        os.path.join(windir, "Fonts", name)
+        for name in (
+            "msyh.ttc",      # 微软雅黑
+            "msyhbd.ttc",
+            "simsun.ttc",    # 宋体
+            "simhei.ttf",    # 黑体
+            "NotoSansCJK-Regular.ttc",
+            "SourceHanSansSC-Regular.otf",
+        )
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    logger.warning(
+        "未找到 CJK 字体（可设置环境变量 AH21_CJK_FONT）。"
+        "双层 PDF 中文可能显示异常。"
+    )
+    return None
+
+
 from rapid_doc.backend.office.office_analyze import office_analyze
 from rapid_doc.backend.office.office_middle_json_mkcontent import union_make as office_union_make
 from rapid_doc.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
@@ -286,8 +315,8 @@ def _build_config():
         # "markdown_ignore_labels": ["number", "footnote", "header", "header_image", "footer", "footer_image", "aside_text",],
         # 双层 PDF 文本层：不写入以下 block 类型的文字（与 markdown_ignore_labels 类似）
         # "layered_pdf_ignore_block_types": ["image_footnote", "table_footnote", "image_caption", "table_caption"],
-        # 图版 PDF 建议配置 CJK 字体路径，否则中文可能显示为错误字符
-        "layered_pdf_cjk_font_path": r"C:\Windows\Fonts\msyh.ttc",
+        # CJK 字体：AH21_CJK_FONT 或自动探测系统字体
+        "layered_pdf_cjk_font_path": _resolve_cjk_font_path(),
     }
 
     ocr_config = {
@@ -603,11 +632,11 @@ r"D:\Users\ah21\OneDrive\PDFSearchViewer\docs\参考文献\图书质量专项检
     for doc_path in doc_path_list:
         start_time = time.time()
         # 运行方式：auto/txt/ocr
-        METHOD = "auto"
+        method = "auto"
         # 语言：ch chinese_cht en korean japan ta te ka
-        LANG = None
+        lang = None
         doc_path = Path(doc_path)
         # 默认输出到 PDF 同目录下的同名文件夹
         output_dir = str(doc_path.parent)
-        parse_doc([doc_path], output_dir, method=METHOD, lang=LANG)
+        parse_doc([doc_path], output_dir, method=method, lang=lang)
         print(f"总运行时间: {time.time() - start_time}秒")
